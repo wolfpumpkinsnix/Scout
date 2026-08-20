@@ -69,7 +69,7 @@ class FakeReranker:
         return result
 
 
-def one_chunk_per_document(documents, _model, _chunk_size, _chunk_overlap):
+def one_chunk_per_document(documents, _chunk_size, _chunk_overlap):
     return [DocumentChunk(document, 0, document.text, 0) for document in documents]
 
 
@@ -371,8 +371,8 @@ class DocumentIndexerTests(unittest.TestCase):
         args = SimpleNamespace(
             no_rerank=False, always_rerank=False, mode="hybrid", collection=None, top_k=5)
         embedding_model = object()
-        with patch("src.document_indexer._preload_search_models",
-                   return_value=(embedding_model, None)) as preload, \
+        with patch("src.document_indexer._preload_embedding_model",
+                   return_value=embedding_model) as preload, \
                 patch("builtins.input", side_effect=["first", "second", "exit"]), \
                 patch("src.document_indexer._write_json"):
             _run_shell(indexer, args)
@@ -380,7 +380,7 @@ class DocumentIndexerTests(unittest.TestCase):
         self.assertEqual(indexer.search.call_count, 2)
         self.assertTrue(all(
             call.kwargs["model"] is embedding_model
-            and call.kwargs["reranker"] is None
+            and "reranker" not in call.kwargs
             and call.kwargs["rerank"] is None
             for call in indexer.search.call_args_list))
 
@@ -389,8 +389,8 @@ class DocumentIndexerTests(unittest.TestCase):
             cases.write_text(
                 '[{"query":"q","expected_paths":["expected.md"]}]', encoding="utf-8")
             args.cases = cases
-            with patch("src.document_indexer._preload_search_models",
-                       return_value=(embedding_model, None)):
+            with patch("src.document_indexer._preload_embedding_model",
+                       return_value=embedding_model):
                 result = _run_benchmark(indexer, args)
         self.assertEqual(result["summary"]["mean_recall"], 1.0)
         self.assertEqual(result["summary"]["mean_reciprocal_rank"], 1.0)
@@ -483,7 +483,7 @@ class DocumentIndexerTests(unittest.TestCase):
             "Article 35\n1. Last first\n2. Last second\n"
         )
         document = InputDocument(text, ".", "synthetic.pdf", "hash")
-        chunks = chunk_documents([document], None, 50, 8)
+        chunks = chunk_documents([document], 50, 8)
         article_chunks = [chunk for chunk in chunks if "Article " in chunk.text]
         self.assertEqual(len(article_chunks), 3)
         self.assertTrue(all(chunk.text.count("Article ") == 1 for chunk in article_chunks))
@@ -503,12 +503,12 @@ class DocumentIndexerTests(unittest.TestCase):
                 (root / f"sample{suffix}").write_bytes(b"binary")
             with patch("docling.document_converter.DocumentConverter") as converter:
                 converter.return_value.convert.return_value = converted
-                documents = read_input_documents([root])
+                documents = read_input_documents(root)
 
             self.assertEqual({Path(item.relative_path).suffix for item in documents},
                              set(suffixes))
             self.assertTrue(all(item.text == "# Report\n\n1. Item" for item in documents))
-            chunks = chunk_documents([documents[1]], None, 50, 8)
+            chunks = chunk_documents([documents[1]], 50, 8)
             self.assertTrue(any("Report" in chunk.text and "1. Item" in chunk.text
                                 for chunk in chunks))
 

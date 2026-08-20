@@ -113,21 +113,17 @@ def _input_document(path: Path, root: Path) -> InputDocument:
                          hashlib.sha256(text.encode()).hexdigest())
 
 
-def read_input_documents(paths: list[Path]) -> list[InputDocument]:
-    result: list[InputDocument] = []
-    for path in paths:
-        resolved = path.resolve()
-        if path.is_dir():
-            result.extend(
-                _input_document(file, resolved)
-                for file in sorted(resolved.rglob("*"))
-                if file.is_file() and file.suffix.lower() in DOCUMENT_SUFFIXES
-            )
-        elif path.is_file():
-            result.append(_input_document(resolved, resolved.parent))
-        else:
-            raise FileNotFoundError(f"Document path not found: {path}")
-    return result
+def read_input_documents(path: Path) -> list[InputDocument]:
+    resolved = path.resolve()
+    if path.is_dir():
+        return [
+            _input_document(file, resolved)
+            for file in sorted(resolved.rglob("*"))
+            if file.is_file() and file.suffix.lower() in DOCUMENT_SUFFIXES
+        ]
+    if path.is_file():
+        return [_input_document(resolved, resolved.parent)]
+    raise FileNotFoundError(f"Document path not found: {path}")
 
 
 def documents_schema() -> Any:

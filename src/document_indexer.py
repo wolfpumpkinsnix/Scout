@@ -348,7 +348,7 @@ class DocumentIndexer:
         if not path.exists():
             raise FileNotFoundError(f"Document path not found: {path}")
         LOGGER.info("phase=scan path=%s", path)
-        documents = read_input_documents([path])
+        documents = read_input_documents(path)
         if not documents:
             raise ValueError(f"No supported documents found: {path}")
         LOGGER.info("phase=scan-complete documents=%d", len(documents))
@@ -755,23 +755,20 @@ def _write_json(value: Any) -> None:
     sys.stdout.flush()
 
 
-def _preload_search_models(indexer: DocumentIndexer, mode: str,
-                           rerank: bool | None) -> tuple[Any | None, Any | None]:
-    embedding_model = None
-    reranker = None
-    if mode in {"vector", "hybrid"}:
-        started = time.perf_counter()
-        embedding_model = load_embedding_model(
-            indexer.config.model_path, indexer.config.gpu_layers,
-            indexer.config.flash_attn)
-        LOGGER.info("phase=load-model-complete seconds=%.3f",
-                    time.perf_counter() - started)
-    return embedding_model, reranker
+def _preload_embedding_model(indexer: DocumentIndexer, mode: str) -> Any | None:
+    if mode not in {"vector", "hybrid"}:
+        return None
+    started = time.perf_counter()
+    model = load_embedding_model(
+        indexer.config.model_path, indexer.config.gpu_layers,
+        indexer.config.flash_attn)
+    LOGGER.info("phase=load-model-complete seconds=%.3f", time.perf_counter() - started)
+    return model
 
 
 def _run_shell(indexer: DocumentIndexer, args: Any) -> None:
     rerank = True if getattr(args, "always_rerank", False) else False if args.no_rerank else None
-    embedding_model, reranker = _preload_search_models(indexer, args.mode, rerank)
+    embedding_model = _preload_embedding_model(indexer, args.mode)
     LOGGER.info("phase=shell-ready mode=%s; type exit or quit to stop", args.mode)
     while True:
         try:
@@ -786,7 +783,7 @@ def _run_shell(indexer: DocumentIndexer, args: Any) -> None:
         try:
             _write_json(indexer.search(
                 query, collections=args.collection, mode=args.mode, top_k=args.top_k,
-                model=embedding_model, rerank=rerank, reranker=reranker))
+                model=embedding_model, rerank=rerank))
         except (RuntimeError, ValueError) as error:
             clear_progress()
             LOGGER.error("%s", error)
@@ -794,7 +791,7 @@ def _run_shell(indexer: DocumentIndexer, args: Any) -> None:
 
 def _run_server(indexer: DocumentIndexer, args: Any) -> None:
     rerank = True if args.always_rerank else False if args.no_rerank else None
-    embedding_model, reranker = _preload_search_models(indexer, args.mode, rerank)
+    embedding_model = _preload_embedding_model(indexer, args.mode)
 
     class Handler(BaseHTTPRequestHandler):
         def _send(self, status: int, payload: Any) -> None:
@@ -841,7 +838,6 @@ def _run_server(indexer: DocumentIndexer, args: Any) -> None:
                     top_k=payload.get("top_k", args.top_k),
                     model=embedding_model,
                     rerank=request_rerank,
-                    reranker=reranker,
                 )
                 self._send(200, result)
             except (json.JSONDecodeError, TypeError, ValueError, RuntimeError) as error:
@@ -877,14 +873,13 @@ def _run_benchmark(indexer: DocumentIndexer, args: Any) -> dict[str, Any]:
                 "each benchmark case needs query and non-empty expected_paths")
 
     rerank = True if getattr(args, "always_rerank", False) else False if args.no_rerank else None
-    embedding_model, reranker = _preload_search_models(indexer, args.mode, rerank)
+    embedding_model = _preload_embedding_model(indexer, args.mode)
     measured: list[dict[str, Any]] = []
     for number, case in enumerate(cases, start=1):
         started = time.perf_counter()
         results = indexer.search(
             case["query"], collections=args.collection, mode=args.mode,
-            top_k=args.top_k, model=embedding_model, rerank=rerank,
-            reranker=reranker)
+            top_k=args.top_k, model=embedding_model, rerank=rerank)
         elapsed = time.perf_counter() - started
         expected = set(map(str, case["expected_paths"]))
         paths = [str(result.get("relative_path")) for result in results]
