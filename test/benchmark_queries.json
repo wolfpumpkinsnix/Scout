@@ -1,0 +1,15 @@
+[
+  {
+    "query": "Quale legge ha convertito il decreto-legge n. 216 del 6 luglio 1993 sull'Ecolabel e quali risorse finanziarie erano autorizzate per il 1993 e il 1994 per l'organismo competente?",
+    "expected_paths": [
+      "Adempimenti finanziari per lattuazione del regolamento CEE n. 880-92 sul marchio di qualita ecologica - Ecolabel.md",
+      "Conversione in legge con modificazioni del decreto-legge 6 luglio 1993 n. 216 recante adempimenti finanziari per lattuazione del regolamento CEE n. 880-92 sul marchio di qualita ecologica - ECOLABEL.md"
+    ]
+  },
+  {
+    "query": "Come devono essere costituite le comunità energetiche dei cittadini e secondo quali condizioni possono condividere l'energia elettrica?",
+    "expected_paths": [
+      "Attuazione della direttiva UE 2019-944 del Parlamento europeo e del Consiglio del 5 giugno 2019 relativa a norme comuni per il mercato interno dellenergia elettrica e che modifica la dire_a38480d60548.md"
+    ]
+  }
+]

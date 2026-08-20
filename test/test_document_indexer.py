@@ -1,0 +1,528 @@
+import io
+import logging
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+import lancedb
+
+from src.document_indexer import (
+    OUTPUT_FIELDS,
+    DocumentChunk,
+    DocumentIndexer,
+    DocumentIndexerConfig,
+    _chunk_position,
+    _create_fts,
+    _rerank,
+    _run_benchmark,
+    _run_shell,
+    _overlap_suffix,
+    chunk_documents,
+    lexicalize_query,
+)
+from src.indexer_support import InputDocument, chunks_schema, read_input_documents
+from src.logging_utils import ColoredFormatter, InteractiveConsoleHandler
+
+
+class FakeEmbeddingModel:
+    def n_embd(self):
+        return 2
+
+    def tokenize(self, value, **_):
+        return value.decode("utf-8").split()
+
+    def detokenize(self, tokens):
+        return " ".join(tokens).encode()
+
+    def create_embedding(self, value):
+        texts = value if isinstance(value, list) else [value]
+        return {"data": [{"embedding": [1.0, float(len(text))]} for text in texts]}
+
+
+class FakeReranker:
+    def __init__(self, outputs=None, context=4096, batch=None):
+        self.outputs = outputs
+        self.context = context
+        self.n_batch = batch or context
+        self.prompts = []
+        self.batches = []
+        self.offset = 0
+
+    def n_ctx(self):
+        return self.context
+
+    def tokenize(self, value, **_):
+        return list(value)
+
+    def detokenize(self, tokens):
+        return bytes(tokens)
+
+    def embed(self, prompts, **_):
+        self.prompts.extend(prompts)
+        self.batches.append(len(prompts))
+        if self.outputs is None:
+            return [[0.8, 0.2] for _ in prompts]
+        result = self.outputs[self.offset:self.offset + len(prompts)]
+        self.offset += len(prompts)
+        return result
+
+
+def one_chunk_per_document(documents, _model, _chunk_size, _chunk_overlap):
+    return [DocumentChunk(document, 0, document.text, 0) for document in documents]
+
+
+class TtyBuffer(io.StringIO):
+    def isatty(self):
+        return True
+
+
+class FakeSearch:
+    def __init__(self, values, limits):
+        self.values = values
+        self.limits = limits
+        self.count = len(values)
+
+    def where(self, _):
+        return self
+
+    def limit(self, count):
+        self.count = count
+        self.limits.append(count)
+        return self
+
+    def to_list(self):
+        return self.values[:self.count]
+
+
+class FakeTable:
+    schema = SimpleNamespace(names=["collection"])
+
+    def __init__(self, fts, vector):
+        self.fts = fts
+        self.vector = vector
+        self.limits = []
+
+    def search(self, _, query_type=None, **__):
+        return FakeSearch(self.fts if query_type == "fts" else self.vector, self.limits)
+
+
+class FakeDb:
+    def __init__(self, table):
+        self.table = table
+
+    def list_tables(self):
+        return SimpleNamespace(tables=["chunks"])
+
+    def open_table(self, _):
+        return self.table
+
+
+class DocumentIndexerTests(unittest.TestCase):
+    def test_interactive_console_keeps_logs_and_progress_together(self):
+        stream = TtyBuffer()
+        handler = InteractiveConsoleHandler(stream)
+        handler.setFormatter(ColoredFormatter("%(levelname)s %(message)s"))
+        logger = logging.getLogger("interactive-console-test")
+        logger.handlers = [handler]
+        logger.propagate = False
+        logger.setLevel(logging.INFO)
+
+        handler.update_progress("Embedding", 0, 2)
+        logger.info("phase=embed-start")
+        handler.update_progress("Embedding", 1, 2)
+        handler.update_progress("Embedding", 2, 2)
+
+        output = stream.getvalue()
+        self.assertIn("\033[", output)
+        self.assertIn("phase=embed-start", output)
+        self.assertIn("50% (1/2)", output)
+        self.assertEqual(handler._progress, "")
+
+    def test_chunks_and_vectors_are_persisted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "doc.md"
+            source.write_text("# Title\n" + "word " * 1200, encoding="utf-8")
+            db_path = root / "db"
+            result = DocumentIndexer(DocumentIndexerConfig(
+                db_path=db_path,
+                chunk_size=50,
+                batch_size=2,
+            )).index(source, FakeEmbeddingModel(), collection="italia")
+
+            self.assertGreater(result["chunks"], 1)
+            db = lancedb.connect(str(db_path))
+            self.assertEqual(db.open_table("documents").count_rows(), 1)
+            self.assertEqual(db.open_table("chunks").count_rows(), result["chunks"])
+            self.assertTrue(all(row["active"] for row in db.open_table("chunks").to_arrow().to_pylist()))
+            self.assertEqual(
+                db.open_table("documents").to_arrow().to_pylist()[0]["collection"], "italia")
+            self.assertEqual(
+                DocumentIndexer(DocumentIndexerConfig(db_path=db_path)).list_collections(),
+                ["italia"])
+            matches = DocumentIndexer(DocumentIndexerConfig(db_path=db_path)).search(
+                "Title", collections=["italia"], model=FakeEmbeddingModel())
+            self.assertTrue(matches)
+            self.assertTrue(DocumentIndexer(DocumentIndexerConfig(db_path=db_path)).search(
+                "Title", collections=["italia"], mode="fts"))
+            self.assertTrue(DocumentIndexer(DocumentIndexerConfig(db_path=db_path)).search(
+                "Title", collections=["italia"], mode="hybrid", model=FakeEmbeddingModel(),
+                rerank=False))
+
+    def test_unchanged_ingest_skips_chunking_and_embedding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "doc.md"
+            source.write_text("unchanged", encoding="utf-8")
+            indexer = DocumentIndexer(DocumentIndexerConfig(db_path=root / "db"))
+            with patch("src.document_indexer.chunk_documents", one_chunk_per_document):
+                indexer.index(source, FakeEmbeddingModel())
+            with patch("src.document_indexer.chunk_documents",
+                       side_effect=AssertionError("must not chunk")), \
+                    patch("src.document_indexer.load_embedding_model",
+                          side_effect=AssertionError("must not load model")):
+                result = indexer.index(source)
+
+            self.assertEqual(result["unchanged"], 1)
+            self.assertEqual(result["embedded"], 0)
+
+    def test_chunk_size_changes_fingerprint_and_forces_reingest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "doc.md"
+            source.write_text("same", encoding="utf-8")
+            db_path = root / "db"
+            with patch("src.document_indexer.chunk_documents", one_chunk_per_document):
+                DocumentIndexer(DocumentIndexerConfig(
+                    db_path=db_path, chunk_size=10)).index(source, FakeEmbeddingModel())
+                result = DocumentIndexer(DocumentIndexerConfig(
+                    db_path=db_path, chunk_size=11)).index(source, FakeEmbeddingModel())
+            self.assertEqual(result["unchanged"], 0)
+            self.assertEqual(result["embedded"], 1)
+
+    def test_overlap_uses_natural_suffix_with_token_limit(self):
+        tokenizer = SimpleNamespace(count_tokens=lambda text: len(text.split()))
+        text = "First paragraph has context. Second sentence stays together. Final item."
+        self.assertEqual(
+            _overlap_suffix(text, tokenizer, 6),
+            "Second sentence stays together. Final item.",
+        )
+
+    def test_chunk_position_uses_prefix_when_docling_reformats_tail(self):
+        source = ("Earlier text.\n8. Where the opinion confirms safeguards in this specific "
+                  "regulatory source text. Original continuation.")
+        needle = ("8. Where the opinion confirms safeguards in this specific regulatory "
+                  "source text. Reformatted continuation.")
+        self.assertEqual(
+            _chunk_position(source, needle, 0, len(source), 0, "doc.pdf"),
+            source.index("8. Where"),
+        )
+
+    def test_failed_update_preserves_active_generation(self):
+        class FailingEmbeddingModel(FakeEmbeddingModel):
+            def create_embedding(self, _value):
+                raise RuntimeError("embedding failed")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "doc.md"
+            source.write_text("old", encoding="utf-8")
+            db_path = root / "db"
+            indexer = DocumentIndexer(DocumentIndexerConfig(db_path=db_path))
+            with patch("src.document_indexer.chunk_documents", one_chunk_per_document):
+                indexer.index(source, FakeEmbeddingModel())
+                db = lancedb.connect(str(db_path))
+                old_id = db.open_table("chunks").to_arrow().to_pylist()[0]["id"]
+                old_hash = db.open_table("documents").to_arrow().to_pylist()[0]["content_hash"]
+                source.write_text("new", encoding="utf-8")
+                result = indexer.index(source, FailingEmbeddingModel())
+
+            active_chunks = db.open_table("chunks").search().where(
+                "active = true").limit(10).to_list()
+            document = db.open_table("documents").to_arrow().to_pylist()[0]
+            self.assertEqual(result["failures"], 1)
+            self.assertEqual([row["id"] for row in active_chunks], [old_id])
+            self.assertEqual(document["content_hash"], old_hash)
+
+    def test_directory_ingest_deactivates_deleted_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus = root / "corpus"
+            corpus.mkdir()
+            (corpus / "a.md").write_text("alpha", encoding="utf-8")
+            deleted = corpus / "b.md"
+            deleted.write_text("beta", encoding="utf-8")
+            db_path = root / "db"
+            indexer = DocumentIndexer(DocumentIndexerConfig(db_path=db_path))
+            with patch("src.document_indexer.chunk_documents", one_chunk_per_document):
+                indexer.index(corpus, FakeEmbeddingModel())
+                deleted.unlink()
+                result = indexer.index(corpus)
+
+            db = lancedb.connect(str(db_path))
+            active_documents = db.open_table("documents").search().where(
+                "active = true").limit(10).to_list()
+            active_chunks = db.open_table("chunks").search().where(
+                "active = true").limit(10).to_list()
+            self.assertEqual(result["deleted"], 1)
+            self.assertEqual([row["relative_path"] for row in active_documents], ["a.md"])
+            self.assertEqual(len(active_chunks), 1)
+
+    def test_lexical_query_keeps_meaningful_terms_and_references(self):
+        italian = lexicalize_query(
+            "Come devono essere costituite le comunità energetiche UE 2019/944?")
+        english = lexicalize_query("How must renewable energy communities share electricity?")
+        self.assertNotIn("come", italian)
+        self.assertNotIn("devono", italian)
+        self.assertIn("comunita", italian)
+        self.assertIn("ue 2019 944", italian)
+        self.assertEqual(english, "renewable energy communities share electricity")
+        self.assertEqual(lexicalize_query("How must what"), "How must what")
+
+    def test_icu_fts_finds_italian_and_english_in_one_table(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = lancedb.connect(str(Path(directory) / "db"))
+            table = db.create_table("chunks", schema=chunks_schema(2))
+            base = {
+                "document_id": "d", "collection": "mixed", "content_hash": "h",
+                "embedding_fingerprint": "e", "chunk_index": 0, "total_chunks": 1,
+                "position": 0, "vector": [1.0, 0.0], "active": True,
+            }
+            table.add([
+                {**base, "id": "it", "text": "comunità energetica e cittadini"},
+                {**base, "id": "en", "text": "renewable energy community citizens"},
+            ])
+            _create_fts(table)
+            indexer = DocumentIndexer(DocumentIndexerConfig(db_path=Path(directory) / "db"))
+            self.assertEqual(indexer.search("comunità cittadini", mode="fts")[0]["id"], "it")
+            self.assertEqual(indexer.search("renewable citizens", mode="fts")[0]["id"], "en")
+
+    def test_hybrid_uses_backend_pool_rrf_dedup_and_compact_output(self):
+        fts = [{"id": f"f{i}", "document_id": "d", "collection": "c", "text": str(i),
+                "chunk_index": i, "total_chunks": 20, "position": i, "_score": float(i)}
+               for i in range(20)]
+        vector = [{"id": "f19" if i == 19 else f"v{i}", "document_id": "d",
+                   "collection": "c", "text": str(i), "chunk_index": i,
+                   "total_chunks": 20, "position": i, "_distance": i / 100}
+                  for i in range(20)]
+        table = FakeTable(fts, vector)
+        with patch("src.document_indexer.lancedb.connect", return_value=FakeDb(table)):
+            results = DocumentIndexer().search(
+                "query", mode="hybrid", top_k=5, model=FakeEmbeddingModel(), rerank=False)
+        self.assertEqual(table.limits, [20, 20])
+        self.assertEqual(len({row["id"] for row in results}), len(results))
+        self.assertEqual(tuple(results[0]), OUTPUT_FIELDS)
+        self.assertNotIn("vector", results[0])
+        self.assertIn("v0", {row["id"] for row in results})
+        self.assertGreater(results[0]["_hybrid_score"], 2 / 61)
+
+    def test_top_k_above_twenty_expands_both_candidate_pools(self):
+        values = [{"id": str(i), "document_id": "d", "collection": "c", "text": str(i),
+                   "chunk_index": i, "total_chunks": 25, "position": i,
+                   "_score": 25 - i, "_distance": i / 100} for i in range(25)]
+        table = FakeTable(values, values)
+        with patch("src.document_indexer.lancedb.connect", return_value=FakeDb(table)):
+            results = DocumentIndexer().search(
+                "query", mode="hybrid", top_k=25, model=FakeEmbeddingModel(), rerank=False)
+        self.assertEqual(table.limits, [25, 25])
+        self.assertEqual(len(results), 25)
+
+    def test_reranker_batches_truncates_and_validates_rank_output(self):
+        candidates = [{"text": "x" * 1000}, {"text": "short"}]
+        reranker = FakeReranker(
+            [[0.9, 0.1], [0.2, 0.8]], context=800, batch=400)
+        self.assertEqual(_rerank(reranker, "query", candidates), [0.9, 0.2])
+        self.assertEqual(len(reranker.prompts), 2)
+        self.assertLessEqual(len(reranker.prompts[0].encode()), 400)
+        self.assertEqual(reranker.batches, [1, 1])
+        with self.assertRaisesRegex(RuntimeError, "incompatible reranker output"):
+            _rerank(FakeReranker([[float("nan"), 0.5]]), "q", [{"text": "d"}])
+
+    def test_reranker_scores_duplicate_text_once(self):
+        reranker = FakeReranker([[0.8, 0.2], [0.3, 0.7]])
+        scores = _rerank(
+            reranker, "query", [{"text": "same"}, {"text": "same"}, {"text": "other"}])
+        self.assertEqual(scores, [0.8, 0.8, 0.3])
+        self.assertEqual(len(reranker.prompts), 2)
+
+    def test_reranker_caps_candidates_and_document_tokens(self):
+        values = [
+            {"id": str(i), "document_id": "d", "collection": "c",
+             "text": "x" * 100 + str(i), "chunk_index": i, "total_chunks": 5,
+             "position": i, "_score": 5 - i, "_distance": i / 10}
+            for i in range(5)
+        ]
+        table = FakeTable(values, values)
+        reranker = FakeReranker()
+        with patch("src.document_indexer.lancedb.connect", return_value=FakeDb(table)):
+            DocumentIndexer(DocumentIndexerConfig(
+                rerank_candidates=3, rerank_max_tokens=10)).search(
+                    "query", mode="hybrid", top_k=2, model=FakeEmbeddingModel(),
+                    rerank=True, reranker=reranker)
+        self.assertEqual(len(reranker.prompts), 3)
+        self.assertIn("<Document>: " + "x" * 10, reranker.prompts[0])
+        self.assertNotIn("<Document>: " + "x" * 11, reranker.prompts[0])
+
+    def test_shell_and_benchmark_reuse_preloaded_models(self):
+        indexer = SimpleNamespace()
+        indexer.search = Mock(return_value=[{"relative_path": "expected.md"}])
+        args = SimpleNamespace(
+            no_rerank=False, always_rerank=False, mode="hybrid", collection=None, top_k=5)
+        embedding_model = object()
+        with patch("src.document_indexer._preload_search_models",
+                   return_value=(embedding_model, None)) as preload, \
+                patch("builtins.input", side_effect=["first", "second", "exit"]), \
+                patch("src.document_indexer._write_json"):
+            _run_shell(indexer, args)
+        preload.assert_called_once()
+        self.assertEqual(indexer.search.call_count, 2)
+        self.assertTrue(all(
+            call.kwargs["model"] is embedding_model
+            and call.kwargs["reranker"] is None
+            and call.kwargs["rerank"] is None
+            for call in indexer.search.call_args_list))
+
+        with tempfile.TemporaryDirectory() as directory:
+            cases = Path(directory) / "cases.json"
+            cases.write_text(
+                '[{"query":"q","expected_paths":["expected.md"]}]', encoding="utf-8")
+            args.cases = cases
+            with patch("src.document_indexer._preload_search_models",
+                       return_value=(embedding_model, None)):
+                result = _run_benchmark(indexer, args)
+        self.assertEqual(result["summary"]["mean_recall"], 1.0)
+        self.assertEqual(result["summary"]["mean_reciprocal_rank"], 1.0)
+
+    def test_hybrid_reranks_and_missing_model_suggests_download(self):
+        values = [
+            {"id": str(i), "document_id": "d", "collection": "c", "text": str(i),
+             "chunk_index": i, "total_chunks": 2, "position": i,
+             "_score": 2 - i, "_distance": i / 10}
+            for i in range(2)
+        ]
+        table = FakeTable(values, values)
+        with patch("src.document_indexer.lancedb.connect", return_value=FakeDb(table)):
+            results = DocumentIndexer().search(
+                "query", mode="hybrid", top_k=2, model=FakeEmbeddingModel(),
+                rerank=True, reranker=FakeReranker([[0.1, 0.9], [0.9, 0.1]]))
+            self.assertEqual(results[0]["id"], "1")
+            with self.assertRaisesRegex(RuntimeError, "download_models.ps1 -Model reranker"):
+                DocumentIndexer(DocumentIndexerConfig(
+                    reranker_model_path=Path("missing.gguf"))).search(
+                        "query", mode="hybrid", model=FakeEmbeddingModel(), rerank=True)
+
+    def test_auto_rerank_skips_agreeing_rankings_and_missing_model(self):
+        values = [
+            {"id": str(i), "document_id": "d", "collection": "c", "text": str(i),
+             "chunk_index": i, "total_chunks": 2, "position": i,
+             "_score": 2 - i, "_distance": i / 10}
+            for i in range(2)
+        ]
+        table = FakeTable(values, values)
+        indexer = DocumentIndexer(DocumentIndexerConfig(
+            reranker_model_path=Path("missing.gguf")))
+        with patch("src.document_indexer.lancedb.connect", return_value=FakeDb(table)), \
+                patch("src.document_indexer.load_reranker_model",
+                      side_effect=AssertionError("must not load")), \
+                self.assertLogs("document-indexer", level="INFO") as logs:
+            results = indexer.search(
+                "query", mode="hybrid", top_k=2, model=FakeEmbeddingModel())
+        self.assertTrue(all(result["_rerank_score"] is None for result in results))
+        self.assertTrue(any("policy=auto decision=skip reason=top-2-agree" in line
+                            for line in logs.output))
+
+        one = FakeTable(values[:1], values[:1])
+        with patch("src.document_indexer.lancedb.connect", return_value=FakeDb(one)), \
+                patch("src.document_indexer.load_reranker_model",
+                      side_effect=AssertionError("must not load")):
+            single = indexer.search(
+                "query", mode="hybrid", top_k=1, model=FakeEmbeddingModel())
+        self.assertIsNone(single[0]["_rerank_score"])
+
+    def test_auto_rerank_runs_on_disagreement_and_reuses_model(self):
+        def value(identifier, rank):
+            return {"id": identifier, "document_id": "d", "collection": "c",
+                    "text": identifier, "chunk_index": rank, "total_chunks": 2,
+                    "position": rank, "_score": 2 - rank, "_distance": rank / 10}
+
+        table = FakeTable([value("a", 0), value("b", 1)],
+                          [value("b", 0), value("a", 1)])
+        reranker = FakeReranker()
+        indexer = DocumentIndexer()
+        with patch("src.document_indexer.lancedb.connect", return_value=FakeDb(table)), \
+                patch("src.document_indexer.load_reranker_model",
+                      return_value=reranker) as load:
+            first = indexer.search(
+                "query", mode="hybrid", top_k=2, model=FakeEmbeddingModel())
+            indexer.search("query", mode="hybrid", top_k=2, model=FakeEmbeddingModel())
+        load.assert_called_once()
+        self.assertTrue(all(result["_rerank_score"] is not None for result in first))
+
+    def test_rerank_overrides_always_and_never(self):
+        values = [{"id": "a", "document_id": "d", "collection": "c", "text": "a",
+                   "chunk_index": 0, "total_chunks": 1, "position": 0,
+                   "_score": 1.0, "_distance": 0.1}]
+        table = FakeTable(values, values)
+        reranker = FakeReranker()
+        with patch("src.document_indexer.lancedb.connect", return_value=FakeDb(table)):
+            never = DocumentIndexer().search(
+                "query", mode="hybrid", model=FakeEmbeddingModel(),
+                rerank=False, reranker=reranker)
+            always = DocumentIndexer().search(
+                "query", mode="hybrid", model=FakeEmbeddingModel(),
+                rerank=True, reranker=reranker)
+        self.assertIsNone(never[0]["_rerank_score"])
+        self.assertIsNotNone(always[0]["_rerank_score"])
+
+    def test_pdf_articles_are_chunked_separately_with_positions(self):
+        text = (
+            "Preface\n\nArticle 33\n1. First item\n2. Second item\n\n"
+            "Article 34\n1. New first\n2. New second\n\n"
+            "Article 35\n1. Last first\n2. Last second\n"
+        )
+        document = InputDocument(text, ".", "synthetic.pdf", "hash")
+        chunks = chunk_documents([document], None, 50, 8)
+        article_chunks = [chunk for chunk in chunks if "Article " in chunk.text]
+        self.assertEqual(len(article_chunks), 3)
+        self.assertTrue(all(chunk.text.count("Article ") == 1 for chunk in article_chunks))
+        self.assertTrue(all("1." in chunk.text for chunk in article_chunks))
+        positions = [chunk.position for chunk in chunks]
+        self.assertEqual(positions, sorted(positions))
+        self.assertTrue(any(position > 0 for position in positions))
+
+    def test_office_and_open_document_formats_are_converted_to_markdown(self):
+        suffixes = (".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+                    ".odt", ".ods", ".odp")
+        converted = SimpleNamespace(document=SimpleNamespace(
+            export_to_markdown=lambda: "# Report\r\n\r\n1. Item\ufffe"))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for suffix in suffixes:
+                (root / f"sample{suffix}").write_bytes(b"binary")
+            with patch("docling.document_converter.DocumentConverter") as converter:
+                converter.return_value.convert.return_value = converted
+                documents = read_input_documents([root])
+
+            self.assertEqual({Path(item.relative_path).suffix for item in documents},
+                             set(suffixes))
+            self.assertTrue(all(item.text == "# Report\n\n1. Item" for item in documents))
+            chunks = chunk_documents([documents[1]], None, 50, 8)
+            self.assertTrue(any("Report" in chunk.text and "1. Item" in chunk.text
+                                for chunk in chunks))
+
+    def test_vector_and_fts_never_load_reranker(self):
+        values = [{"id": "1", "document_id": "d", "collection": "c", "text": "query",
+                   "chunk_index": 0, "total_chunks": 1, "position": 0,
+                   "_score": 1.0, "_distance": 0.1}]
+        table = FakeTable(values, values)
+        with patch("src.document_indexer.lancedb.connect", return_value=FakeDb(table)), \
+                patch("src.document_indexer.load_reranker_model",
+                      side_effect=AssertionError("must not load")):
+            DocumentIndexer().search("query", mode="fts")
+            DocumentIndexer().search("query", mode="vector", model=FakeEmbeddingModel())
+
+
+if __name__ == "__main__":
+    unittest.main()
