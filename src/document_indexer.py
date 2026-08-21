@@ -1,5 +1,5 @@
 """Document chunking, embedding, and LanceDB persistence."""
-# pyright: reportMissingTypeStubs=false, reportUnknownVariableType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false, reportCallIssue=false, reportArgumentType=false
+# pyright: reportMissingTypeStubs=false, reportUnknownVariableType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false, reportCallIssue=false, reportArgumentType=false, reportUnknownLambdaType=false
 
 import argparse
 import bisect
@@ -18,7 +18,7 @@ from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Sequence, cast
+from typing import Any, Sequence
 from urllib.parse import parse_qs, unquote, urlsplit
 
 import lancedb
@@ -103,9 +103,12 @@ RERANK_SYSTEM = (
     "Judge whether the Document meets the requirements based on the Query and the "
     'Instruct provided. Note that the answer can only be "yes" or "no".'
 )
-CHUNKER_VERSION = "adaptive-overlap-v3"
+CHUNKER_VERSION = "adaptive-overlap-v4"
 LARGE_SECTION_CHARS = 1_000_000
 ARTICLE_HEADING = re.compile(r"(?m)^[ \t]*(Article[ \t]+\d+[A-Za-z]?)[ \t]*$")
+# Microsoft Learn style: "...title... Article • 02/03/2023 body..."
+ARTICLE_METADATA = re.compile(
+    r"(?:Article\s*•\s*|Last updated on\s+)\d{1,2}/\d{1,2}/\d{4}")
 OUTPUT_FIELDS = (
     "id", "document_id", "collection", "title", "relative_path", "chunk_index",
     "total_chunks", "position", "text", "_fts_rank", "_fts_score", "_vector_rank",
@@ -349,9 +352,18 @@ def lexicalize_query(query: str) -> str:
 
 
 def _dedup_by_document(results: list[Row]) -> list[Row]:
-    seen: set[str] = set()
-    return [row for row in results
-            if not (str(row["document_id"]) in seen or seen.add(str(row["document_id"])))]
+    # Drop same-document chunks adjacent to an already-kept one: neighbours
+    # overlap by design. Distant chunks are different sections, keep them.
+    kept: dict[str, list[int]] = {}
+    deduped: list[Row] = []
+    for row in results:
+        document_id = str(row["document_id"])
+        index = int(row.get("chunk_index") or -1)
+        if any(abs(index - other) <= 1 for other in kept.get(document_id, ())):
+            continue
+        kept.setdefault(document_id, []).append(index)
+        deduped.append(row)
+    return deduped
 
 
 _TOC_LINE = re.compile(r"^\s*(.{0,100}?\.{4,}\s*\d+|\d{1,4})\s*$")
@@ -486,6 +498,17 @@ def load_embedding_model(path: Path, gpu_layers: str | int = "auto",
 
 
 def _pdf_sections(text: str) -> list[tuple[int, int, str]]:
+    markers = list(ARTICLE_METADATA.finditer(text))
+    if markers:
+        # The article body starts after its "Article • date" marker; the title
+        # line just before the marker stays at the tail of the previous
+        # section — one title line of contamination beats merging articles.
+        boundaries = [0] + [match.end() for match in markers]
+        return [
+            (start, end, text[start:end])
+            for start, end in zip(boundaries, boundaries[1:] + [len(text)])
+            if text[start:end].strip()
+        ]
     matches = list(ARTICLE_HEADING.finditer(text))
     if not matches:
         return [(0, len(text), text)]
@@ -607,6 +630,18 @@ def _docling_chunkers(max_tokens: int) -> tuple[Any, Any]:
     return hybrid, LineBasedTokenChunker(tokenizer=hybrid.tokenizer, prefix="")
 
 
+def _drop_repeated(local: list[tuple[str, int, DocumentChunk]],
+                   threshold: int = 3) -> list[DocumentChunk]:
+    # Page furniture (prerequisites, install steps) repeats verbatim across
+    # articles and floods candidate pools; drop chunks whose text appears in
+    # >= threshold distinct sections. Repetition inside one section is content.
+    sections_by_text: dict[str, set[int]] = {}
+    for raw, section_start, _ in local:
+        sections_by_text.setdefault(raw, set()).add(section_start)
+    return [chunk for raw, _, chunk in local
+            if len(sections_by_text[raw]) < threshold]
+
+
 def chunk_documents(
     documents: list[InputDocument], chunk_size: int, overlap_tokens: int
 ) -> list[DocumentChunk]:
@@ -638,6 +673,7 @@ def chunk_documents(
         sections = (_pdf_sections(source_text) if suffix == ".pdf"
                     else [(0, len(source_text), "")])
         document_chunks: list[Any] = []
+        local_chunks: list[tuple[str, int, DocumentChunk]] = []
         for section_start, section_end, markdown in sections:
             converted = (converter.convert_string(
                 markdown, InputFormat.MD, name=source.stem).document
@@ -666,13 +702,16 @@ def chunk_documents(
                         source_text, overlap, previous_position, chunk_position,
                         chunk_position, document.relative_path, normalized)
                     text = f"{text[:-len(chunk.text)]}{overlap}\n{chunk.text}"
-                chunks.append(DocumentChunk(
-                    working_document, len(document_chunks), text, stored_position))
+                local_chunks.append((chunk.text, section_start, DocumentChunk(
+                    working_document, len(document_chunks), text, stored_position)))
                 document_chunks.append(chunk)
                 previous_text = chunk.text
                 previous_position = chunk_position
-        LOGGER.info("phase=docling-chunk document=%s chunks=%d",
-                    document.relative_path, len(document_chunks))
+        kept = _drop_repeated(local_chunks)
+        chunks.extend(kept)
+        LOGGER.info("phase=docling-chunk document=%s chunks=%d dropped=%d",
+                    document.relative_path, len(kept),
+                    len(local_chunks) - len(kept))
         update_progress("Chunking", document_number, len(documents))
     return chunks
 
@@ -682,6 +721,13 @@ class DocumentIndexer:
         # field validation lives in DocumentIndexerConfig.__post_init__
         self.config = config
         self._reranker: Any | None = None
+
+    @property
+    def reranker_loaded(self) -> bool:
+        return self._reranker is not None
+
+    def reset_reranker(self) -> None:
+        self._reranker = None
 
     def index(
         self, path: Path, model: Any | None = None, collection: str = "default",
@@ -744,13 +790,13 @@ class DocumentIndexer:
         pending_documents: list[InputDocument] = []
         for document in documents:
             existing = existing_documents.get(document_ids[document.id])
-            active_chunks = active_chunk_counts[document_ids[document.id]]
+            active_count = active_chunk_counts[document_ids[document.id]]
             unchanged = bool(
                 existing and existing.get("active")
                 and existing.get("content_hash") == document.content_hash
                 and existing.get("embedding_fingerprint") == embedding_fingerprint
                 and int(existing.get("total_chunks") or 0) > 0
-                and active_chunks == int(existing["total_chunks"])
+                and active_count == int(existing["total_chunks"])
             )
             if not unchanged:
                 pending_documents.append(document)
@@ -802,6 +848,7 @@ class DocumentIndexer:
                 raise ValueError(
                     f"Existing LanceDB vector dimension is {current_dimension}, expected {dimension}"
                 )
+        assert chunks_table is not None  # created above when missing
         if "text_fts" not in chunks_table.schema.names:
             chunks_table.add_columns({"text_fts": TEXT_FTS_MIGRATION_SQL})
         LOGGER.info("phase=database-ready path=%s dimension=%d", self.config.db_path, dimension)
@@ -1388,7 +1435,7 @@ def _run_server(indexer: DocumentIndexer, args: Any) -> None:
                 self._send(200, {
                     **indexer.status(),
                     "embedding_model_loaded": embedding_model is not None,
-                    "reranker_model_loaded": indexer._reranker is not None,
+                    "reranker_model_loaded": indexer.reranker_loaded,
                 })
                 return
             if parsed.path != "/health":
@@ -1397,7 +1444,7 @@ def _run_server(indexer: DocumentIndexer, args: Any) -> None:
             self._send(200, {
                 "status": "ok",
                 "embedding_model_loaded": embedding_model is not None,
-                "reranker_model_loaded": indexer._reranker is not None,
+                "reranker_model_loaded": indexer.reranker_loaded,
             })
 
         def do_DELETE(self) -> None:
@@ -1450,6 +1497,21 @@ def _run_server(indexer: DocumentIndexer, args: Any) -> None:
                             or not all(isinstance(value, str) for value in names)):
                         raise ValueError("'collections' must be an array of strings")
                     self._send(200, {"results": indexer.update_collections(names, embedding_model)})
+                    return
+                if path == "/chunks":
+                    payload = self._json_body()
+                    source_path = payload.get("path")
+                    if not isinstance(source_path, str) or not source_path.strip():
+                        raise ValueError("'path' must be a non-empty string")
+                    chunk_size = payload.get("chunk_size", indexer.config.chunk_size)
+                    chunk_overlap = payload.get(
+                        "chunk_overlap", indexer.config.chunk_overlap)
+                    if not isinstance(chunk_size, int) or chunk_size < 1:
+                        raise ValueError("'chunk_size' must be a positive integer")
+                    if chunk_overlap is not None and not isinstance(chunk_overlap, int):
+                        raise ValueError("'chunk_overlap' must be an integer or null")
+                    self._send(200, _run_chunk(
+                        Path(source_path), chunk_size, chunk_overlap))
                     return
                 if path == "/feedback":
                     payload = self._json_body()
@@ -1554,7 +1616,7 @@ def _run_server(indexer: DocumentIndexer, args: Any) -> None:
                         LOGGER.info("phase=load-model-complete seconds=%.3f",
                                     time.perf_counter() - load_started)
                     if new_config.reranker_model_path != old.reranker_model_path:
-                        indexer._reranker = None  # lazy reload on next query
+                        indexer.reset_reranker()  # lazy reload on next query
                     indexer.config = new_config
                     _write_config(CONFIG_PATH, _config_snapshot(new_config))
                     self._send(200, _config_snapshot(new_config))
@@ -1595,6 +1657,25 @@ def _run_server(indexer: DocumentIndexer, args: Any) -> None:
         pass
     finally:
         server.server_close()
+
+
+def _run_chunk(file: Path, chunk_size: int,
+               chunk_overlap: int | None) -> dict[str, Any]:
+    documents = read_input_documents(file)
+    if not documents:
+        raise ValueError(f"No supported documents found: {file}")
+    overlap = chunk_overlap if chunk_overlap is not None else round(chunk_size * 0.15)
+    if chunk_size < 1 or not 0 <= overlap < chunk_size:
+        raise ValueError("chunk_overlap must be smaller than chunk_size")
+    started = time.perf_counter()
+    chunks = chunk_documents(documents, chunk_size, overlap)
+    LOGGER.info("phase=chunk-only-complete chunks=%d seconds=%.3f",
+                len(chunks), time.perf_counter() - started)
+    return {
+        "count": len(chunks),
+        "chunks": [{"index": chunk.index, "position": chunk.position,
+                    "text": chunk.text} for chunk in chunks],
+    }
 
 
 def _run_benchmark(indexer: DocumentIndexer, args: Any) -> dict[str, Any]:
@@ -1674,6 +1755,11 @@ def main() -> int:
     ingest = subparsers.add_parser("ingest")
     ingest.add_argument("file", type=Path)
     ingest.add_argument("--collection", default="default")
+    chunk = subparsers.add_parser("chunk")
+    chunk.add_argument("file", type=Path)
+    chunk.add_argument("--chunk-size", type=int, default=900)
+    chunk.add_argument("--chunk-overlap", type=int)
+    chunk.add_argument("--db-path", type=Path, default=Path("data/lancedb"))
     query = subparsers.add_parser("query")
     query.add_argument("text")
     _add_search_arguments(query)
@@ -1790,6 +1876,8 @@ def main() -> int:
         elif args.command == "serve":
             _run_server(indexer, args)
             return 0
+        elif args.command == "chunk":
+            result = _run_chunk(args.file, args.chunk_size, args.chunk_overlap)
         elif args.command == "benchmark":
             result = _run_benchmark(indexer, args)
         else:

@@ -242,6 +242,8 @@ Gli altri endpoint sono:
   il drag-and-drop.
 - `DELETE /documents/{id}`: elimina un documento e i suoi chunk.
 - `GET /status`: conteggi di documenti, chunk e collezioni.
+- `POST /chunks` con `{"path": "...", "chunk_size": 900}`: solo chunking, senza
+  embedding (anteprima rapida; equivalente CLI: `python -m src.document_indexer chunk FILE`).
 - `GET /config`: configurazione attiva (modelli, gpu_layers, min_score, parametri rerank).
 - `PUT /config`: aggiorna le stesse chiavi, le persiste in `config.json` e ricarica
   il modello di embedding se `model_path` cambia. All'avvio vale la priorità

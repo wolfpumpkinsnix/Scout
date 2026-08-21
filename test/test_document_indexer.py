@@ -1,3 +1,5 @@
+# pyright: reportPrivateUsage=false, reportMissingParameterType=false, reportUnknownParameterType=false, reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportUnknownLambdaType=false, reportArgumentType=false, reportCallIssue=false, reportIndexIssue=false, reportIncompatibleMethodOverride=false, reportMissingTypeStubs=false
+# Test doubles (fakes/mocks) are intentionally untyped; they exercise privates.
 import io
 import json
 import logging
@@ -340,6 +342,46 @@ class DocumentIndexerTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 _apply_config(config, {"gpu_layers": "turbo"})
 
+    def test_chunk_only_command(self):
+        from src.document_indexer import _run_chunk
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "doc.md"
+            source.write_text("# Title\n\n" + "some words here. " * 200,
+                              encoding="utf-8")
+            result = _run_chunk(source, 50, None)
+            self.assertGreater(result["count"], 1)
+            self.assertEqual(
+                set(result["chunks"][0]), {"index", "position", "text"})
+            self.assertIn("some words", result["chunks"][0]["text"])
+            with self.assertRaisesRegex(ValueError, "chunk_overlap"):
+                _run_chunk(source, 50, 50)
+            empty = Path(directory) / "empty"
+            empty.mkdir()
+            with self.assertRaisesRegex(ValueError, "No supported documents"):
+                _run_chunk(empty, 50, None)
+
+    def test_pdf_sections_split_on_learn_metadata_and_drop_repeated(self):
+        from src.document_indexer import _drop_repeated, _pdf_sections
+        text = ("Preamble content.\n"
+                "Inheritance in C# Article • 02/03/2023 Body of the first article. "
+                "Pattern matching Article • 05/11/2024 Body of the second article.")
+        sections = _pdf_sections(text)
+        self.assertEqual(len(sections), 3)
+        self.assertIn("Preamble", sections[0][2])
+        self.assertTrue(sections[1][2].startswith(" Body of the first"))
+        self.assertIn("second article", sections[2][2])
+        # legal-style fallback still works
+        self.assertEqual(len(_pdf_sections("Article 1\nBody\nArticle 2\nMore")), 2)
+
+        def dc(text):
+            return DocumentChunk(InputDocument(text, ".", "d.pdf", "h"), 0, text, 0)
+        local = [("repeat", 0, dc("x-repeat")), ("repeat", 10, dc("x-repeat")),
+                 ("repeat", 20, dc("x-repeat")), ("unique", 0, dc("x-unique")),
+                 ("same-section", 0, dc("x-same")), ("same-section", 0, dc("x-same")),
+                 ("same-section", 0, dc("x-same"))]
+        self.assertEqual([c.text for c in _drop_repeated(local)],
+                         ["x-unique", "x-same", "x-same", "x-same"])
+
     def test_tech_tokens_boilerplate_and_dedup(self):
         from src.document_indexer import _dedup_by_document, _is_boilerplate
         from src.indexer_support import normalize_tech_tokens
@@ -349,9 +391,12 @@ class DocumentIndexerTests(unittest.TestCase):
         self.assertTrue(_is_boilerplate(
             "Indice\n\nIntroduzione .......... 1\nCapitolo 1 ........ 5\n2"))
         self.assertFalse(_is_boilerplate("# Article 33\n\n1. First item"))
-        rows = [{"document_id": "a", "id": "1"}, {"document_id": "a", "id": "2"},
-                {"document_id": "b", "id": "3"}]
-        self.assertEqual([row["id"] for row in _dedup_by_document(rows)], ["1", "3"])
+        rows = [{"document_id": "a", "id": "1", "chunk_index": 4},
+                {"document_id": "a", "id": "2", "chunk_index": 5},
+                {"document_id": "a", "id": "2b", "chunk_index": 9},
+                {"document_id": "b", "id": "3", "chunk_index": 0}]
+        self.assertEqual([row["id"] for row in _dedup_by_document(rows)],
+                         ["1", "2b", "3"])
 
     def test_lexical_query_keeps_all_terms_and_references(self):
         italian = lexicalize_query(
