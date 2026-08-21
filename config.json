@@ -1,6 +1,6 @@
 {
-  "model_path": "models\\Qwen3-Embedding-0.6B-Q8_0.gguf",
-  "reranker_model_path": "models\\qwen3-reranker-0.6b-q8_0.gguf",
+  "model_path": "models/Qwen3-Embedding-0.6B-Q8_0.gguf",
+  "reranker_model_path": "models/qwen3-reranker-0.6b-q8_0.gguf",
   "gpu_layers": "auto",
   "flash_attn": false,
   "min_score": 0.0,
