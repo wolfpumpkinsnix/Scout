@@ -87,8 +87,15 @@ Endpoints:
 
 - `GET /health`: returns `{"status":"ok"}`.
 - `GET /collections`: returns active collection names.
+- `GET /documents` and `GET /documents/{id}`: list documents or retrieve
+  document metadata and reconstructed text.
+- `GET /status`: returns document, chunk, and collection counts.
 - `POST /query`: accepts `query` (required), optional `collections` (string
   array), `mode` (`vector`, `fts`, or `hybrid`), `top_k`, and `rerank`.
+- `POST /feedback`: accepts a `document_id`, `relevant` boolean, and optional
+  query for ranking feedback.
+- `POST /ingest`: accepts multipart `files` plus a `collection` field for
+  drag-and-drop ingestion of one or more supported documents.
 
 `rerank` can be `true`, `false`, or `null`. Missing or `null` uses adaptive
 reranking, the default. The server binds to `127.0.0.1:8181`; use `--host`

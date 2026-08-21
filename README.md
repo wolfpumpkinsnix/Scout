@@ -135,6 +135,15 @@ mentre `GET /health` verifica che il server sia attivo; termina con `Ctrl-C`.
 `true`, `false` o `null`: se assente o `null`, il server usa il reranking
 adattivo, che è il default.
 
+Gli altri endpoint sono:
+
+- `GET /documents?collection=italia`: elenco dei documenti attivi.
+- `GET /documents/{id}`: metadati e testo ricostruito dai chunk.
+- `GET /status`: conteggi di documenti, chunk e collezioni.
+- `POST /feedback`: riceve `{"document_id":"...","relevant":true,"query":"..."}`.
+- `POST /ingest`: multipart con uno o più campi `files` e il campo
+  `collection`; accetta PDF, Markdown, testo e reStructuredText.
+
 Il benchmark incluso misura recall, reciprocal rank e latenza sulle query note:
 
 ```powershell

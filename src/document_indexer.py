@@ -7,11 +7,15 @@ import logging
 import math
 import re
 import sys
+import tempfile
 import time
+from email import policy
+from email.parser import BytesParser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence, cast
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import lancedb
 from lancedb.index import FTS
@@ -23,6 +27,7 @@ from docling_core.transforms.chunker.hybrid_chunker import HybridChunker
 from src.indexer_support import (
     DEFAULT_EMBEDDING_MODEL,
     DEFAULT_RERANKER_MODEL,
+    DOCUMENT_SUFFIXES,
     EMBEDDING_BATCH_SIZE,
     DOCLING_DOCUMENT_SUFFIXES,
     InputDocument,
@@ -275,9 +280,8 @@ def _overlap_suffix(text: str, tokenizer: Any, max_tokens: int) -> str:
 
 
 def chunk_documents(
-    documents: list[InputDocument], model: Any, chunk_size: int, overlap_tokens: int
+    documents: list[InputDocument], chunk_size: int, overlap_tokens: int
 ) -> list[DocumentChunk]:
-    del model
     converter = DocumentConverter()
     chunker = HybridChunker()
     docling_tokenizer: Any = chunker.tokenizer
@@ -441,8 +445,7 @@ class DocumentIndexer:
                 )
         LOGGER.info("phase=database-ready path=%s dimension=%d", self.config.db_path, dimension)
         chunk_started = time.perf_counter()
-        chunks = chunk_documents(
-            pending_documents, embedding_model, chunk_size, chunk_overlap)
+        chunks = chunk_documents(pending_documents, chunk_size, chunk_overlap)
         LOGGER.info("phase=chunk-complete chunks=%d seconds=%.3f",
                     len(chunks), time.perf_counter() - chunk_started)
 
@@ -591,6 +594,65 @@ class DocumentIndexer:
             for row in db.open_table("documents").to_arrow().to_pylist()
             if row.get("active") and row.get("collection")
         })
+
+    def list_documents(self, collection: str | None = None) -> list[Row]:
+        db: Any = lancedb.connect(str(self.config.db_path))
+        if "documents" not in db.list_tables().tables:
+            return []
+        documents = [
+            {
+                "id": row["id"],
+                "collection": row["collection"],
+                "relative_path": row["relative_path"],
+                "title": row["title"],
+                "total_chunks": row["total_chunks"],
+                "updated_at": row["updated_at"],
+            }
+            for row in db.open_table("documents").to_arrow().to_pylist()
+            if row.get("active") and (collection is None or row.get("collection") == collection)
+        ]
+        return sorted(documents, key=lambda row: (row["collection"], row["relative_path"]))
+
+    def get_document(self, document_id: str) -> Row | None:
+        db: Any = lancedb.connect(str(self.config.db_path))
+        if "documents" not in db.list_tables().tables:
+            return None
+        document = next(
+            (row for row in db.open_table("documents").to_arrow().to_pylist()
+             if row.get("id") == document_id and row.get("active")),
+            None,
+        )
+        if document is None:
+            return None
+        chunks = []
+        if "chunks" in db.list_tables().tables:
+            chunks = [
+                row for row in db.open_table("chunks").to_arrow().to_pylist()
+                if row.get("document_id") == document_id and row.get("active")
+            ]
+        chunks.sort(key=lambda row: int(row["chunk_index"]))
+        return {
+            "id": document["id"],
+            "collection": document["collection"],
+            "relative_path": document["relative_path"],
+            "title": document["title"],
+            "total_chunks": document["total_chunks"],
+            "updated_at": document["updated_at"],
+            "text": "\n\n".join(str(row["text"]) for row in chunks),
+        }
+
+    def status(self) -> dict[str, Any]:
+        db: Any = lancedb.connect(str(self.config.db_path))
+        documents = self.list_documents()
+        chunks = 0
+        if "chunks" in db.list_tables().tables:
+            chunks = db.open_table("chunks").count_rows("active = true")
+        return {
+            "documents": len(documents),
+            "chunks": chunks,
+            "collections": self.list_collections(),
+            "db_path": str(self.config.db_path),
+        }
 
     def search(
         self,
@@ -794,6 +856,36 @@ def _run_server(indexer: DocumentIndexer, args: Any) -> None:
     embedding_model = _preload_embedding_model(indexer, args.mode)
 
     class Handler(BaseHTTPRequestHandler):
+        def _json_body(self) -> dict[str, Any]:
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length))
+            if not isinstance(payload, dict):
+                raise ValueError("request body must be a JSON object")
+            return payload
+
+        def _multipart_body(self) -> tuple[dict[str, str], list[tuple[str, bytes]]]:
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length)
+            headers = (
+                f"Content-Type: {self.headers['Content-Type']}\r\n"
+                "MIME-Version: 1.0\r\n\r\n"
+            ).encode("ascii")
+            message = BytesParser(policy=policy.default).parsebytes(headers + body)
+            if not message.is_multipart():
+                raise ValueError("invalid multipart/form-data body")
+            fields: dict[str, str] = {}
+            files: list[tuple[str, bytes]] = []
+            for part in message.iter_parts():
+                name = part.get_param("name", header="content-disposition")
+                filename = part.get_filename()
+                if not isinstance(name, str):
+                    continue
+                if filename is None:
+                    fields[name] = part.get_content()
+                else:
+                    files.append((Path(filename).name, part.get_payload(decode=True) or b""))
+            return fields, files
+
         def _send(self, status: int, payload: Any) -> None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
@@ -803,23 +895,77 @@ def _run_server(indexer: DocumentIndexer, args: Any) -> None:
             self.wfile.write(body)
 
         def do_GET(self) -> None:
-            if self.path == "/collections":
+            parsed = urlsplit(self.path)
+            if parsed.path == "/collections":
                 self._send(200, {"collections": indexer.list_collections()})
                 return
-            if self.path != "/health":
+            if parsed.path == "/documents":
+                collection = parse_qs(parsed.query).get("collection", [None])[0]
+                self._send(200, {"documents": indexer.list_documents(collection)})
+                return
+            if parsed.path.startswith("/documents/"):
+                document = indexer.get_document(unquote(parsed.path[len("/documents/"):]))
+                if document is None:
+                    self._send(404, {"error": "document not found"})
+                else:
+                    self._send(200, document)
+                return
+            if parsed.path == "/status":
+                self._send(200, {
+                    **indexer.status(),
+                    "embedding_model_loaded": embedding_model is not None,
+                    "reranker_model_loaded": indexer._reranker is not None,
+                })
+                return
+            if parsed.path != "/health":
                 self._send(404, {"error": "not found"})
                 return
-            self._send(200, {"status": "ok"})
+            self._send(200, {
+                "status": "ok",
+                "embedding_model_loaded": embedding_model is not None,
+                "reranker_model_loaded": indexer._reranker is not None,
+            })
 
         def do_POST(self) -> None:
-            if self.path != "/query":
-                self._send(404, {"error": "not found"})
-                return
             try:
-                length = int(self.headers.get("Content-Length", "0"))
-                payload = json.loads(self.rfile.read(length))
-                if not isinstance(payload, dict):
-                    raise ValueError("request body must be a JSON object")
+                path = urlsplit(self.path).path
+                if path == "/feedback":
+                    payload = self._json_body()
+                    if not isinstance(payload.get("document_id"), str):
+                        raise ValueError("'document_id' must be a string")
+                    if not isinstance(payload.get("relevant"), bool):
+                        raise ValueError("'relevant' must be a boolean")
+                    LOGGER.info("feedback document_id=%s relevant=%s query=%r",
+                                payload["document_id"], payload["relevant"],
+                                payload.get("query"))
+                    self._send(202, {"accepted": True})
+                    return
+                if path == "/ingest":
+                    content_type = self.headers.get("Content-Type", "")
+                    if not content_type.startswith("multipart/form-data"):
+                        raise ValueError("Content-Type must be multipart/form-data")
+                    fields, uploads = self._multipart_body()
+                    uploads = [upload for upload in uploads if upload[0]]
+                    collection = fields.get("collection", "default").strip()
+                    if not collection:
+                        raise ValueError("'collection' must not be empty")
+                    if not uploads:
+                        raise ValueError("at least one file is required in 'files'")
+                    results = []
+                    with tempfile.TemporaryDirectory() as directory:
+                        for index, (filename, content) in enumerate(uploads):
+                            if Path(filename).suffix.lower() not in DOCUMENT_SUFFIXES:
+                                raise ValueError(f"unsupported file: {filename}")
+                            target = Path(directory) / f"{index}-{filename}"
+                            target.write_bytes(content)
+                            results.append(indexer.index(
+                                target, model=embedding_model, collection=collection))
+                    self._send(200, {"files": len(results), "results": results})
+                    return
+                if path != "/query":
+                    self._send(404, {"error": "not found"})
+                    return
+                payload = self._json_body()
                 query = payload.get("query")
                 if not isinstance(query, str) or not query.strip():
                     raise ValueError("'query' must be a non-empty string")
@@ -840,7 +986,7 @@ def _run_server(indexer: DocumentIndexer, args: Any) -> None:
                     rerank=request_rerank,
                 )
                 self._send(200, result)
-            except (json.JSONDecodeError, TypeError, ValueError, RuntimeError) as error:
+            except (json.JSONDecodeError, OSError, TypeError, ValueError, RuntimeError) as error:
                 clear_progress()
                 self._send(400, {"error": str(error)})
 
