@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "graphify": {
+      "type": "stdio",
+      "command": "C:\\Users\\giacomob\\AppData\\Local\\Programs\\Python\\Python313\\python.exe",
+      "args": [
+        "-m",
+        "graphify.serve",
+        "C:\\Users\\giacomob\\qwen-embeddings-pipeline\\graphify-out\\graph.json"
+      ],
+      "env": {}
+    }
+  }
+}
