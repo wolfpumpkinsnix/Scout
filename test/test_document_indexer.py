@@ -353,16 +353,17 @@ class DocumentIndexerTests(unittest.TestCase):
                 {"document_id": "b", "id": "3"}]
         self.assertEqual([row["id"] for row in _dedup_by_document(rows)], ["1", "3"])
 
-    def test_lexical_query_keeps_meaningful_terms_and_references(self):
+    def test_lexical_query_keeps_all_terms_and_references(self):
         italian = lexicalize_query(
             "Come devono essere costituite le comunità energetiche UE 2019/944?")
         english = lexicalize_query("How must renewable energy communities share electricity?")
-        self.assertNotIn("come", italian)
-        self.assertNotIn("devono", italian)
+        self.assertIn("come", italian)
+        self.assertIn("devono", italian)
         self.assertIn("comunita", italian)
         self.assertIn("ue 2019 944", italian)
-        self.assertEqual(english, "renewable energy communities share electricity")
-        self.assertEqual(lexicalize_query("How must what"), "How must what")
+        self.assertEqual(
+            english, "how must renewable energy communities share electricity")
+        self.assertEqual(lexicalize_query("How must what"), "how must what")
 
     def test_icu_fts_finds_italian_and_english_in_one_table(self):
         with tempfile.TemporaryDirectory() as directory:

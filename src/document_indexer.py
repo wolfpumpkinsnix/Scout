@@ -98,14 +98,6 @@ FTS_OPTIONS = {
     "lower_case": True,
     "ascii_folding": True,
 }
-LEXICAL_STOP_WORDS = {
-    "a", "al", "alla", "and", "are", "be", "can", "che", "chi", "come",
-    "cosa", "dei", "del", "della", "delle", "devono", "deve", "di", "do",
-    "does", "dove", "e", "essere", "gli", "how", "i", "il", "in", "is",
-    "la", "le", "lo", "must", "of", "on", "per", "perche", "perché",
-    "possono", "puo", "può", "quale", "quali", "quando", "secondo", "should",
-    "the", "to", "un", "una", "what", "when", "where", "which", "who", "why",
-}
 RERANK_INSTRUCTION = "Given a web search query, retrieve relevant passages that answer the query"
 RERANK_SYSTEM = (
     "Judge whether the Document meets the requirements based on the Query and the "
@@ -353,8 +345,7 @@ def _apply_config(config: DocumentIndexerConfig,
 def lexicalize_query(query: str) -> str:
     tokens = [token.text for token in lancedb.tokenize(
         normalize_tech_tokens(query), **FTS_OPTIONS)]
-    lexical = " ".join(token for token in tokens if token.casefold() not in LEXICAL_STOP_WORDS)
-    return lexical or query
+    return " ".join(tokens) or query
 
 
 def _dedup_by_document(results: list[Row]) -> list[Row]:
