@@ -899,7 +899,7 @@ class DocumentIndexer:
                 "updated_at": now(),
             })
             LOGGER.info("phase=prepare-complete document=%d/%d seconds=%.3f",
-                        len(document_rows), len(documents),
+                        len(document_rows), len(pending_documents),
                         time.perf_counter() - document_started)
         failures = 0
         batch_count = (len(chunks) + self.config.batch_size - 1) // self.config.batch_size
@@ -1042,6 +1042,7 @@ class DocumentIndexer:
             chunks_table.delete(f"document_id = {document_id!r}")
             _create_fts(chunks_table)
         documents_table.delete(f"id = {document_id!r}")
+        LOGGER.info("phase=document-remove id=%s", document_id)
         return 1
 
     def remove_collection(self, name: str) -> int:
@@ -1061,6 +1062,7 @@ class DocumentIndexer:
             chunks_table.delete(f"collection = {name!r}")
             _create_fts(chunks_table)
         documents_table.delete(f"collection = {name!r}")
+        LOGGER.info("phase=collection-remove name=%s documents=%d", name, len(documents))
         return len(documents)
 
     def update_collections(self, names: list[str] | None = None,
@@ -1259,11 +1261,13 @@ class DocumentIndexer:
                     fused[key].update({name: result.get(name) for name in (
                         rank_field, "_fts_score", "_vector_distance") if result.get(name) is not None})
                 scores[key] = scores.get(key, 0.0) + weight / (60 + rank)
+        fused_count = len(scores)
         candidates = _dedup_by_document(
             [{**fused[key], "_hybrid_score": scores[key]}
              for key in sorted(scores, key=scores.get, reverse=True)])
-        LOGGER.info("phase=fusion-complete candidates=%d seconds=%.3f",
-                    len(candidates), time.perf_counter() - fusion_started)
+        LOGGER.info("phase=fusion-complete fused=%d candidates=%d deduped=%d seconds=%.3f",
+                    fused_count, len(candidates), fused_count - len(candidates),
+                    time.perf_counter() - fusion_started)
         policy = "auto" if rerank is None else "always" if rerank else "never"
         compare = min(2, len(candidates))
         agreed = bool(compare and len(text_results) >= compare and len(vector_results) >= compare
@@ -1299,8 +1303,11 @@ class DocumentIndexer:
                 candidates.sort(key=lambda row: (row["_rerank_score"],
                                                   row["_hybrid_score"]), reverse=True)
                 if self.config.min_score > 0:
+                    before = len(candidates)
                     candidates = [row for row in candidates
                                   if row["_rerank_score"] >= self.config.min_score]
+                    LOGGER.info("phase=min-score-filter threshold=%.2f dropped=%d",
+                                self.config.min_score, before - len(candidates))
                 LOGGER.info("phase=rerank-complete candidates=%d seconds=%.3f",
                             len(candidates), time.perf_counter() - rerank_started)
             except Exception as error:
@@ -1643,6 +1650,7 @@ def _run_server(indexer: DocumentIndexer, args: Any) -> None:
                         indexer.reset_reranker()  # lazy reload on next query
                     indexer.config = new_config
                     _write_config(CONFIG_PATH, _config_snapshot(new_config))
+                    LOGGER.info("phase=config-update keys=%s", sorted(payload))
                     self._send(200, _config_snapshot(new_config))
                     return
                 if not path.startswith("/collections/"):
@@ -1710,11 +1718,13 @@ def _run_benchmark(indexer: DocumentIndexer, args: Any) -> dict[str, Any]:
     if not isinstance(cases, list) or not cases:
         raise ValueError("benchmark cases must be a non-empty JSON array")
     for case in cases:
+        expected_paths = case.get("expected_paths", []) if isinstance(case, dict) else []
+        expected_text = case.get("expected_text", []) if isinstance(case, dict) else []
         if (not isinstance(case, dict) or not str(case.get("query", "")).strip()
-                or not isinstance(case.get("expected_paths"), list)
-                or not case["expected_paths"]):
+                or not isinstance(expected_paths, list) or not isinstance(expected_text, list)
+                or not (expected_paths or expected_text)):
             raise ValueError(
-                "each benchmark case needs query and non-empty expected_paths")
+                "each benchmark case needs query and expected_paths or expected_text")
 
     rerank = True if getattr(args, "always_rerank", False) else False if args.no_rerank else None
     embedding_model = _preload_embedding_model(indexer, args.mode)
@@ -1725,17 +1735,33 @@ def _run_benchmark(indexer: DocumentIndexer, args: Any) -> dict[str, Any]:
             case["query"], collections=args.collection, mode=args.mode,
             top_k=args.top_k, model=embedding_model, rerank=rerank)
         elapsed = time.perf_counter() - started
-        expected = set(map(str, case["expected_paths"]))
+        expected_paths = set(map(str, case.get("expected_paths", [])))
+        # PDF text has hard line wraps; collapse whitespace before matching
+        expected_text = {" ".join(str(needle).split()).casefold()
+                         for needle in case.get("expected_text", [])}
         paths = [str(result.get("relative_path")) for result in results]
-        matched = expected.intersection(paths)
+        texts = [" ".join(str(result.get("text")).split()).casefold()
+                 for result in results]
+        matched_paths = expected_paths.intersection(paths)
+        matched_text = {needle for needle in expected_text
+                        if any(needle in text for text in texts)}
+        total_expected = len(expected_paths) + len(expected_text)
+        matched = len(matched_paths) + len(matched_text)
+
+        def hit(result: Any) -> bool:
+            return (str(result.get("relative_path")) in expected_paths
+                    or any(needle in " ".join(str(result.get("text")).split()).casefold()
+                           for needle in expected_text))
+
         first_rank = next(
-            (rank for rank, path in enumerate(paths, start=1) if path in expected), None)
+            (rank for rank, result in enumerate(results, start=1) if hit(result)),
+            None)
         measured.append({
             "query": case["query"],
             "seconds": elapsed,
-            "recall": len(matched) / len(expected),
+            "recall": matched / total_expected,
             "reciprocal_rank": 0.0 if first_rank is None else 1.0 / first_rank,
-            "matched_paths": sorted(matched),
+            "matched": sorted(matched_paths | matched_text),
             "top_paths": paths,
         })
         LOGGER.info("phase=benchmark-case case=%d/%d recall=%.3f rr=%.3f seconds=%.3f",
