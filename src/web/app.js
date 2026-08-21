@@ -2,6 +2,7 @@ const messages = document.getElementById("messages");
 const question = document.getElementById("question");
 const form = document.getElementById("chat-form");
 const send = document.getElementById("send");
+const clear = document.getElementById("clear");
 const mode = document.getElementById("mode");
 const searchCollection = document.getElementById("search-collection");
 const uploadForm = document.getElementById("upload-form");
@@ -30,17 +31,15 @@ function addAnswer(body) {
     message.append(node("div", "empty", "No indexed passage matched that question."));
   } else {
     message.append(node("div", "bubble", body.answer));
-    const sources = body.sources || [];
-    if (sources.length) {
+    const [source] = body.sources || [];
+    if (source) {
       const list = node("div", "results");
-      for (const [index, source] of sources.entries()) {
-        const card = node("article", "result");
-        const head = node("div", "result-head");
-        head.append(node("div", "result-title", `[${index + 1}] ${source.title || source.relative_path || "Untitled document"}`));
-        head.append(node("div", "path", source.collection || ""));
-        card.append(head, node("div", "path", source.relative_path || ""), node("div", "excerpt", source.text || ""));
-        list.append(card);
-      }
+      const card = node("article", "result");
+      const head = node("div", "result-head");
+      head.append(node("div", "result-title", `[1] ${source.title || source.relative_path || "Untitled document"}`));
+      head.append(node("div", "path", source.collection || ""));
+      card.append(head, node("div", "path", source.relative_path || ""), node("div", "excerpt", source.text || ""));
+      list.append(card);
       message.append(list);
     }
   }
@@ -117,6 +116,11 @@ form.addEventListener("submit", async event => {
     send.textContent = "Ask";
     question.focus();
   }
+});
+
+clear.addEventListener("click", () => {
+  messages.replaceChildren();
+  question.focus();
 });
 
 question.addEventListener("keydown", event => {
