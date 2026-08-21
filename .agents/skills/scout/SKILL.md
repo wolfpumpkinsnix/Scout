@@ -11,7 +11,7 @@ Docling, chunks them with `HybridChunker`, embeds them with GGUF through
 
 ## Setup
 
-Run from the project root on Windows:
+Run from the project root on every platform:
 
 ```powershell
 uv sync
@@ -23,11 +23,28 @@ Place an embedding model in `models/`, for example:
 models/Qwen3-Embedding-0.6B-Q8_0.gguf
 ```
 
-For automatic GPU backend installation:
+Download models on Windows or macOS/Linux:
+
+```powershell
+.\scripts\download_models.ps1 -Model all
+```
+
+```bash
+bash scripts/download_models.sh all
+```
+
+Install the automatic Windows backend or the macOS Metal backend:
 
 ```powershell
 .\scripts\install_llama_backend.ps1
 ```
+
+```bash
+bash scripts/install_llama_backend.sh
+```
+
+On Linux, `uv sync` provides CPU support. CUDA and Vulkan installation commands
+are documented in `README.md`; the Metal script intentionally rejects Linux.
 
 The loader uses GPU offload automatically when the installed llama.cpp build
 supports it and falls back to CPU otherwise.
@@ -100,7 +117,7 @@ Endpoints:
   paths and file patterns in `index.yml`; `POST` also ingests matching files.
 - `POST /update` (or JSON `POST /ingest`): ingest registered collections, optionally
   filtered with `{"collections":["italia"]}`.
-- `DELETE /documents/{id}`: deactivate a document and its chunks.
+- `DELETE /documents/{id}`: delete a document and its chunks.
 - `POST /documents` with JSON `{path, collection}` indexes an existing local file;
   multipart remains available for drag-and-drop uploads.
 

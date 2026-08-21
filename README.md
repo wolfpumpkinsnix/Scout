@@ -19,7 +19,19 @@ data/
   lancedb/
 ```
 
-Scarica il modello embedding predefinito, oppure anche il modello chat:
+## Script di supporto
+
+Gli script PowerShell sono per Windows; quelli Bash per macOS e Linux:
+
+| Operazione | Windows | macOS | Linux |
+|---|---|---|---|
+| Scaricare i modelli | `download_models.ps1` | `download_models.sh` | `download_models.sh` |
+| Installare il backend llama.cpp | `install_llama_backend.ps1` | `install_llama_backend.sh` (Metal) | comandi sotto |
+| Creare l'archivio del progetto | `create_archive.ps1` | `create_archive.sh` | `create_archive.sh` |
+
+### Download dei modelli
+
+Windows PowerShell:
 
 ```powershell
 .\scripts\download_models.ps1
@@ -29,11 +41,66 @@ Scarica il modello embedding predefinito, oppure anche il modello chat:
 .\scripts\download_models.ps1 -Model all
 ```
 
-Su macOS:
+macOS e Linux (`curl` richiesto):
 
 ```bash
+bash scripts/download_models.sh embedding
+bash scripts/download_models.sh gemma
+bash scripts/download_models.sh chat
+bash scripts/download_models.sh reranker
 bash scripts/download_models.sh all
+```
+
+Gli script non riscaricano file esistenti. Per forzarne la sostituzione:
+
+```powershell
+.\scripts\download_models.ps1 -Model embedding -Force
+```
+
+```bash
+FORCE=1 bash scripts/download_models.sh embedding
+```
+
+### Backend llama.cpp
+
+Su Windows lo script prova, nell'ordine, CUDA, Vulkan e CPU:
+
+```powershell
+.\scripts\install_llama_backend.ps1
+```
+
+Su macOS compila la versione bloccata in `uv.lock` con Metal e verifica che
+l'offload GPU sia disponibile:
+
+```bash
 bash scripts/install_llama_backend.sh
+```
+
+Su Linux non viene usato lo script Metal. `uv sync` installa il backend CPU;
+per NVIDIA CUDA è disponibile la wheel CUDA 12.4:
+
+```bash
+uv pip install --reinstall --no-cache-dir llama-cpp-python \
+  --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
+```
+
+Per Vulkan, dopo avere installato SDK Vulkan, compilatore C/C++ e CMake:
+
+```bash
+CMAKE_ARGS="-DGGML_VULKAN=on" uv pip install --reinstall --no-cache-dir \
+  --no-binary llama-cpp-python llama-cpp-python
+```
+
+### Archivio del progetto
+
+Gli script creano `Archive/scout-<timestamp>.zip`, escludendo ambiente virtuale,
+build, modelli, database e repository Git. Su macOS/Linux è richiesto `zip`:
+
+```powershell
+.\scripts\create_archive.ps1
+```
+
+```bash
 bash scripts/create_archive.sh
 ```
 
@@ -81,8 +148,6 @@ uv run python -m src.document_indexer query "Ecolabel" `
 # ricostruisce solo l'indice testuale
 uv run python -m src.document_indexer reindex-fts --db-path data\lancedb
 
-# installa automaticamente il backend llama.cpp più adatto oppure CPU
-.\scripts\install_llama_backend.ps1
 ```
 
 `--gpu-layers auto` abilita l'offload quando disponibile; è possibile passare
@@ -193,13 +258,6 @@ Il benchmark incluso misura recall, reciprocal rank e latenza sulle query note:
 ```powershell
 uv run python -m src.document_indexer benchmark .\test\benchmark_queries.json `
   --collection italia --db-path data\lancedb
-```
-
-Su macOS, lo script compila la versione bloccata in `uv.lock` con Metal e termina con
-errore se l'offload GPU non è disponibile:
-
-```bash
-bash scripts/install_llama_backend.sh
 ```
 
 ## Storage
