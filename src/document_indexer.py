@@ -46,6 +46,13 @@ from src.indexer_support import (
 from src.logging_utils import clear_progress, configure_colored_logging, update_progress
 
 LOGGER = logging.getLogger("document-indexer")
+WEB_ROOT = Path(__file__).with_name("web")
+WEB_ASSETS = {
+    "/": ("index.html", "text/html; charset=utf-8"),
+    "/chat": ("index.html", "text/html; charset=utf-8"),
+    "/app.css": ("app.css", "text/css; charset=utf-8"),
+    "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+}
 
 
 @dataclass(frozen=True)
@@ -1350,8 +1357,20 @@ def _run_server(indexer: DocumentIndexer, args: Any) -> None:
             self.end_headers()
             self.wfile.write(encoded)
 
+        def _send_asset(self, filename: str, content_type: str) -> None:
+            body = (WEB_ROOT / filename).read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def do_GET(self) -> None:
             parsed = urlsplit(self.path)
+            asset = WEB_ASSETS.get(parsed.path)
+            if asset is not None:
+                self._send_asset(*asset)
+                return
             if parsed.path == "/openapi.json":
                 self._send(200, OPENAPI_SPEC)
                 return
