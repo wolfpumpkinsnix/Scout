@@ -118,7 +118,9 @@ uv run python -m src.document_indexer serve `
 
 Poi invia le query a `http://127.0.0.1:8181/query` con JSON
 `{"query":"Ecolabel","rerank":false}`. `GET /collections` restituisce le collezioni attive,
-mentre `GET /health` verifica che il server sia attivo; termina con `Ctrl-C`.
+mentre `GET /health` verifica che il server sia attivo. La documentazione interattiva
+è disponibile su `http://127.0.0.1:8181/docs`, con lo schema OpenAPI grezzo su
+`http://127.0.0.1:8181/openapi.json`. Termina il server con `Ctrl-C`.
 
 ## Collection registry e update
 
@@ -175,6 +177,10 @@ Gli altri endpoint sono:
   il drag-and-drop.
 - `DELETE /documents/{id}`: elimina un documento e i suoi chunk.
 - `GET /status`: conteggi di documenti, chunk e collezioni.
+- `GET /config`: configurazione attiva (modelli, gpu_layers, min_score, parametri rerank).
+- `PUT /config`: aggiorna le stesse chiavi, le persiste in `config.json` e ricarica
+  il modello di embedding se `model_path` cambia. All'avvio vale la priorità
+  argomento CLI > `config.json` > default.
 - `POST /feedback`: riceve `{"document_id":"...","relevant":true,"query":"..."}`.
 - `POST /ingest` con JSON avvia l'update delle collection registrate; con multipart
   mantiene l'ingest drag-and-drop tramite i campi `files` e `collection`.

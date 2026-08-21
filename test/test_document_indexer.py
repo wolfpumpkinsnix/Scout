@@ -315,6 +315,31 @@ class DocumentIndexerTests(unittest.TestCase):
             self.assertEqual(db.open_table("documents").count_rows(), 0)
             self.assertEqual(db.open_table("chunks").count_rows(), 0)
 
+    def test_config_file_roundtrip_and_validation(self):
+        from src.document_indexer import (
+            _apply_config, _config_snapshot, _read_config, _write_config,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            self.assertEqual(_read_config(path), {})
+            config = DocumentIndexerConfig()
+            updated = _apply_config(config, {
+                "model_path": "models/embeddinggemma-300m-Q4_0.gguf",
+                "min_score": 0.5, "gpu_layers": 0})
+            self.assertEqual(updated.model_path,
+                             Path("models/embeddinggemma-300m-Q4_0.gguf"))
+            self.assertEqual(updated.min_score, 0.5)
+            _write_config(path, _config_snapshot(updated))
+            self.assertEqual(_read_config(path)["min_score"], 0.5)
+            with self.assertRaisesRegex(ValueError, "Unknown config keys"):
+                _apply_config(config, {"nonsense": 1})
+            with self.assertRaisesRegex(ValueError, "boolean"):
+                _apply_config(config, {"min_score": True})
+            with self.assertRaisesRegex(ValueError, "min_score"):
+                _apply_config(config, {"min_score": 2.0})
+            with self.assertRaises(ValueError):
+                _apply_config(config, {"gpu_layers": "turbo"})
+
     def test_tech_tokens_boilerplate_and_dedup(self):
         from src.document_indexer import _dedup_by_document, _is_boilerplate
         from src.indexer_support import normalize_tech_tokens

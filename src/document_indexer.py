@@ -16,7 +16,7 @@ from email import policy
 from email.parser import BytesParser
 from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Sequence, cast
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -64,6 +64,22 @@ class DocumentIndexerConfig:
     flash_attn: bool = False
     min_score: float = 0.0
 
+    def __post_init__(self) -> None:
+        if self.chunk_size < 1:
+            raise ValueError("chunk_size must be positive")
+        if self.chunk_overlap is not None and not 0 <= self.chunk_overlap < self.chunk_size:
+            raise ValueError("chunk_overlap must be smaller than chunk_size")
+        if self.batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        if self.rerank_candidates < 1:
+            raise ValueError("rerank_candidates must be positive")
+        if self.rerank_max_tokens < 1:
+            raise ValueError("rerank_max_tokens must be positive")
+        if self.reranker_context < 1:
+            raise ValueError("reranker_context must be positive")
+        if not 0 <= self.min_score <= 1:
+            raise ValueError("min_score must be between 0 and 1")
+
 
 @dataclass(frozen=True)
 class DocumentChunk:
@@ -103,6 +119,148 @@ OUTPUT_FIELDS = (
     "total_chunks", "position", "text", "_fts_rank", "_fts_score", "_vector_rank",
     "_vector_distance", "_hybrid_score", "_rerank_score",
 )
+OPENAPI_SPEC = {
+    "openapi": "3.0.3",
+    "info": {
+        "title": "Scout Document Search API",
+        "version": "1.0.0",
+        "description": "Local document indexing and hybrid retrieval API.",
+    },
+    "servers": [{"url": "http://127.0.0.1:8181"}],
+    "paths": {
+        "/health": {"get": {"summary": "Check server health", "responses": {
+            "200": {"description": "Server status"},
+        }}},
+        "/status": {"get": {"summary": "Get index and model status", "responses": {
+            "200": {"description": "Current status"},
+        }}},
+        "/collections": {
+            "get": {"summary": "List collections", "responses": {
+                "200": {"description": "Registered collections"},
+            }},
+            "post": {
+                "summary": "Create and ingest a collection",
+                "requestBody": {"required": True, "content": {
+                    "application/json": {"schema": {"$ref": "#/components/schemas/CollectionInput"}}
+                }},
+                "responses": {"201": {"description": "Collection created"}},
+            },
+        },
+        "/collections/{name}": {
+            "parameters": [{"$ref": "#/components/parameters/CollectionName"}],
+            "get": {"summary": "Get a collection", "responses": {
+                "200": {"description": "Collection details"},
+                "404": {"description": "Collection not found"},
+            }},
+            "put": {
+                "summary": "Update a collection",
+                "requestBody": {"required": True, "content": {
+                    "application/json": {"schema": {"$ref": "#/components/schemas/CollectionInput"}}
+                }},
+                "responses": {"200": {"description": "Collection updated"}},
+            },
+            "delete": {"summary": "Delete a collection", "responses": {
+                "200": {"description": "Collection deleted"},
+            }},
+        },
+        "/documents": {
+            "get": {"summary": "List documents", "parameters": [{
+                "name": "collection", "in": "query", "schema": {"type": "string"},
+            }], "responses": {"200": {"description": "Active documents"}}},
+            "post": {
+                "summary": "Ingest a local file or upload files",
+                "requestBody": {"content": {
+                    "application/json": {"schema": {"$ref": "#/components/schemas/DocumentInput"}},
+                    "multipart/form-data": {"schema": {
+                        "type": "object",
+                        "required": ["files", "collection"],
+                        "properties": {
+                            "files": {"type": "array", "items": {"type": "string", "format": "binary"}},
+                            "collection": {"type": "string"},
+                        },
+                    }},
+                }},
+                "responses": {"201": {"description": "Document indexed"}},
+            },
+        },
+        "/documents/{id}": {
+            "parameters": [{"$ref": "#/components/parameters/DocumentId"}],
+            "get": {"summary": "Get a document", "responses": {
+                "200": {"description": "Document details"},
+                "404": {"description": "Document not found"},
+            }},
+            "delete": {"summary": "Delete a document", "responses": {
+                "200": {"description": "Document deleted"},
+            }},
+        },
+        "/query": {
+            "post": {
+                "summary": "Search indexed documents",
+                "requestBody": {"required": True, "content": {
+                    "application/json": {"schema": {"$ref": "#/components/schemas/QueryInput"}}
+                }},
+                "responses": {"200": {"description": "Ranked search results"}},
+            },
+        },
+        "/feedback": {
+            "post": {"summary": "Submit relevance feedback", "requestBody": {
+                "required": True, "content": {
+                    "application/json": {"schema": {"$ref": "#/components/schemas/FeedbackInput"}}
+                },
+            }, "responses": {"202": {"description": "Feedback accepted"}}},
+        },
+        "/ingest": {
+            "post": {"summary": "Update registered collections or upload files", "responses": {
+                "200": {"description": "Ingest completed"},
+            }},
+        },
+        "/update": {
+            "post": {"summary": "Update registered collections", "responses": {
+                "200": {"description": "Update completed"},
+            }},
+        },
+    },
+    "components": {
+        "parameters": {
+            "CollectionName": {"name": "name", "in": "path", "required": True,
+                               "schema": {"type": "string"}},
+            "DocumentId": {"name": "id", "in": "path", "required": True,
+                           "schema": {"type": "string"}},
+        },
+        "schemas": {
+            "CollectionInput": {"type": "object", "required": ["path"], "properties": {
+                "name": {"type": "string"}, "path": {"type": "string"},
+                "pattern": {"type": "string", "default": "**/*.md"},
+            }},
+            "DocumentInput": {"type": "object", "required": ["path"], "properties": {
+                "path": {"type": "string"}, "collection": {"type": "string", "default": "default"},
+            }},
+            "QueryInput": {"type": "object", "required": ["query"], "properties": {
+                "query": {"type": "string"}, "collections": {"type": "array", "items": {"type": "string"}},
+                "mode": {"type": "string", "enum": ["fts", "vector", "hybrid"], "default": "hybrid"},
+                "top_k": {"type": "integer", "minimum": 1, "default": 5},
+                "rerank": {"type": "boolean", "nullable": True, "default": None},
+            }},
+            "FeedbackInput": {"type": "object", "required": ["document_id", "relevant"],
+                              "properties": {
+                                  "document_id": {"type": "string"},
+                                  "relevant": {"type": "boolean"},
+                                  "query": {"type": "string"},
+                              }},
+        },
+    },
+}
+
+
+def _swagger_html() -> str:
+    return """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>Scout API</title>
+<link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css">
+</head><body><div id="swagger-ui"></div>
+<script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+<script>window.onload=()=>SwaggerUIBundle({url:"/openapi.json",dom_id:"#swagger-ui"});</script>
+</body></html>"""
 
 
 def _read_collection_index(path: Path) -> dict[str, Row]:
@@ -135,6 +293,61 @@ def _write_collection_index(path: Path, collections: dict[str, Row]) -> None:
     } for name, entry in sorted(collections.items())}}
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
                     encoding="utf-8")
+
+
+CONFIG_PATH = Path("config.json")
+# Runtime-tunable keys exposed via config.json and the /config endpoints.
+# chunk_size/overlap stay CLI-only: they change the embedding fingerprint and
+# silently re-embed everything. ponytail: add them here when that is wanted.
+CONFIG_KEYS: dict[str, Any] = {
+    "model_path": str, "reranker_model_path": str, "gpu_layers": (str, int),
+    "flash_attn": bool, "min_score": (int, float), "rerank_candidates": int,
+    "rerank_max_tokens": int, "reranker_context": int,
+}
+
+
+def _read_config(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"Unable to read config {path}: {error}") from error
+    if not isinstance(payload, dict):
+        raise ValueError(f"Invalid config {path}")
+    unknown = set(payload) - set(CONFIG_KEYS)
+    if unknown:
+        raise ValueError(f"Unknown config keys in {path}: {sorted(unknown)}")
+    return payload
+
+
+def _write_config(path: Path, values: dict[str, Any]) -> None:
+    path.write_text(json.dumps(values, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8")
+
+
+def _config_snapshot(config: DocumentIndexerConfig) -> dict[str, Any]:
+    return {key: (str(value) if isinstance(value := getattr(config, key), Path)
+                  else value) for key in CONFIG_KEYS}
+
+
+def _apply_config(config: DocumentIndexerConfig,
+                  values: dict[str, Any]) -> DocumentIndexerConfig:
+    unknown = set(values) - set(CONFIG_KEYS)
+    if unknown:
+        raise ValueError(f"Unknown config keys: {sorted(unknown)}")
+    for key, value in values.items():
+        expected = CONFIG_KEYS[key]
+        if isinstance(value, bool) and expected is not bool:
+            raise ValueError(f"'{key}' must not be a boolean")
+        if not isinstance(value, expected):
+            raise ValueError(f"'{key}' has invalid type")
+    if "gpu_layers" in values and isinstance(values["gpu_layers"], str) \
+            and values["gpu_layers"] != "auto":
+        int(values["gpu_layers"])  # raises ValueError on garbage
+    converted = {key: (Path(value) if key.endswith("_path") else value)
+                 for key, value in values.items()}
+    return replace(config, **converted)
 
 
 def lexicalize_query(query: str) -> str:
@@ -475,20 +688,7 @@ def chunk_documents(
 
 class DocumentIndexer:
     def __init__(self, config: DocumentIndexerConfig = DocumentIndexerConfig()) -> None:
-        if config.chunk_size < 1:
-            raise ValueError("chunk_size must be positive")
-        if config.chunk_overlap is not None and not 0 <= config.chunk_overlap < config.chunk_size:
-            raise ValueError("chunk_overlap must be smaller than chunk_size")
-        if config.batch_size < 1:
-            raise ValueError("batch_size must be positive")
-        if config.rerank_candidates < 1:
-            raise ValueError("rerank_candidates must be positive")
-        if config.rerank_max_tokens < 1:
-            raise ValueError("rerank_max_tokens must be positive")
-        if config.reranker_context < 1:
-            raise ValueError("reranker_context must be positive")
-        if not 0 <= config.min_score <= 1:
-            raise ValueError("min_score must be between 0 and 1")
+        # field validation lives in DocumentIndexerConfig.__post_init__
         self.config = config
         self._reranker: Any | None = None
 
@@ -1151,8 +1351,22 @@ def _run_server(indexer: DocumentIndexer, args: Any) -> None:
             self.end_headers()
             self.wfile.write(body)
 
+        def _send_html(self, status: int, body: str) -> None:
+            encoded = body.encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
         def do_GET(self) -> None:
             parsed = urlsplit(self.path)
+            if parsed.path == "/openapi.json":
+                self._send(200, OPENAPI_SPEC)
+                return
+            if parsed.path in {"/docs", "/docs/"}:
+                self._send_html(200, _swagger_html())
+                return
             if parsed.path == "/collections":
                 self._send(200, {"collections": indexer.collections()})
                 return
@@ -1175,6 +1389,9 @@ def _run_server(indexer: DocumentIndexer, args: Any) -> None:
                     self._send(404, {"error": "document not found"})
                 else:
                     self._send(200, document)
+                return
+            if parsed.path == "/config":
+                self._send(200, _config_snapshot(indexer.config))
                 return
             if parsed.path == "/status":
                 self._send(200, {
@@ -1328,8 +1545,29 @@ def _run_server(indexer: DocumentIndexer, args: Any) -> None:
                 self._send(400, {"error": str(error)})
 
         def do_PUT(self) -> None:
+            nonlocal embedding_model
             try:
                 path = urlsplit(self.path).path
+                if path == "/config":
+                    payload = self._json_body()
+                    new_config = _apply_config(indexer.config, payload)
+                    old = indexer.config
+                    if new_config.model_path != old.model_path \
+                            and embedding_model is not None:
+                        if not new_config.model_path.is_file():
+                            raise ValueError(f"model not found: {new_config.model_path}")
+                        load_started = time.perf_counter()
+                        embedding_model = load_embedding_model(
+                            new_config.model_path, new_config.gpu_layers,
+                            new_config.flash_attn)
+                        LOGGER.info("phase=load-model-complete seconds=%.3f",
+                                    time.perf_counter() - load_started)
+                    if new_config.reranker_model_path != old.reranker_model_path:
+                        indexer._reranker = None  # lazy reload on next query
+                    indexer.config = new_config
+                    _write_config(CONFIG_PATH, _config_snapshot(new_config))
+                    self._send(200, _config_snapshot(new_config))
+                    return
                 if not path.startswith("/collections/"):
                     self._send(404, {"error": "not found"})
                     return
@@ -1510,6 +1748,24 @@ def main() -> int:
             index_path=getattr(args, "index_path", Path("index.yml")),
             min_score=getattr(args, "min_score", 0.0),
         )
+        # Priority: explicit CLI arg > config.json > dataclass default.
+        cli_to_key = {"model": "model_path", "reranker_model": "reranker_model_path",
+                      "gpu_layers": "gpu_layers", "flash_attn": "flash_attn",
+                      "min_score": "min_score", "rerank_candidates": "rerank_candidates",
+                      "rerank_max_tokens": "rerank_max_tokens",
+                      "reranker_context": "reranker_context"}
+        defaults = DocumentIndexerConfig()
+        file_values = _read_config(CONFIG_PATH)
+        merged = {
+            key: file_values[key]
+            for attr, key in cli_to_key.items()
+            if key in file_values
+            and getattr(args, attr, getattr(defaults, key)) == getattr(defaults, key)
+        }
+        config = _apply_config(config, merged)
+        if not CONFIG_PATH.exists():
+            # seed with defaults only; CLI overrides must not become sticky
+            _write_config(CONFIG_PATH, _config_snapshot(DocumentIndexerConfig()))
         indexer = DocumentIndexer(config)
         if args.command == "ingest":
             result = indexer.index(args.file, collection=args.collection)
