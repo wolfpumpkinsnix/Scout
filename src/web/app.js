@@ -24,23 +24,33 @@ function addUser(text) {
   messages.append(message);
 }
 
-function addAnswer(body) {
+function addAnswer(body, seconds) {
   const message = node("article", "message");
   message.append(node("div", "label", "Scout answer"));
   if (!body.answer) {
     message.append(node("div", "empty", "No indexed passage matched that question."));
   } else {
-    message.append(node("div", "bubble", body.answer));
-    const [source] = body.sources || [];
-    if (source) {
+    const bubble = node("div", "bubble markdown");
+    bubble.innerHTML = marked.parse(body.answer);
+    message.append(bubble);
+    if (typeof seconds === "number") {
+      message.append(node("div", "timing", `Answered in ${seconds.toFixed(1)} s`));
+    }
+    const sources = (body.sources || []).filter(source => source);
+    if (sources.length) {
+      const details = node("details", "sources");
+      details.append(node("summary", "sources-summary", `${sources.length} source${sources.length === 1 ? "" : "s"}`));
       const list = node("div", "results");
-      const card = node("article", "result");
-      const head = node("div", "result-head");
-      head.append(node("div", "result-title", `[1] ${source.title || source.relative_path || "Untitled document"}`));
-      head.append(node("div", "path", source.collection || ""));
-      card.append(head, node("div", "path", source.relative_path || ""), node("div", "excerpt", source.text || ""));
-      list.append(card);
-      message.append(list);
+      sources.forEach((source, index) => {
+        const card = node("article", "result");
+        const head = node("div", "result-head");
+        head.append(node("div", "result-title", `[${index + 1}] ${source.title || source.relative_path || "Untitled document"}`));
+        head.append(node("div", "path", source.collection || ""));
+        card.append(head, node("div", "path", source.relative_path || ""), node("div", "excerpt", source.text || ""));
+        list.append(card);
+      });
+      details.append(list);
+      message.append(details);
     }
   }
   messages.append(message);
@@ -94,6 +104,7 @@ form.addEventListener("submit", async event => {
   question.value = "";
   send.disabled = true;
   send.textContent = "Asking";
+  const started = performance.now();
   try {
     const response = await fetch("/ask", {
       method:"POST",
@@ -108,7 +119,7 @@ form.addEventListener("submit", async event => {
     });
     const body = await response.json();
     if (!response.ok) throw new Error(body.error || "Ask failed");
-    addAnswer(body);
+    addAnswer(body, (performance.now() - started) / 1000);
   } catch (error) {
     addFailure(error.message || "Ask failed.");
   } finally {
