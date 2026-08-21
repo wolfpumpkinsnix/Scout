@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Scout Local Search</title>
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <div class="brand"><span class="mark">S</span><span>Scout</span></div>
+      <div class="status"><span id="dot" class="dot"></span><span id="status">Connecting</span></div>
+    </header>
+    <main>
+      <section class="intro">
+        <h1>Ask your local library.</h1>
+        <p>Searches return excerpts from documents indexed on this machine.</p>
+      </section>
+      <section id="messages" aria-live="polite"></section>
+    </main>
+    <footer>
+      <form id="chat-form">
+        <div class="settings">
+          <label>Mode <select id="mode" aria-label="Search mode"><option value="hybrid">Hybrid</option><option value="vector">Vector</option><option value="fts">Full text</option></select></label>
+        </div>
+        <div class="controls">
+          <textarea id="question" placeholder="Ask about your indexed documents" aria-label="Question" required></textarea>
+          <button id="send" type="submit">Search</button>
+        </div>
+      </form>
+    </footer>
+  </div>
+</body>
+</html>

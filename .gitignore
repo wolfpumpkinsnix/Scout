@@ -22,3 +22,4 @@ coverage.xml
 *.orig
 .DS_Store
 Thumbs.db
+nul
