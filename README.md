@@ -87,14 +87,16 @@ uv run python -m src.document_indexer reindex-fts --db-path data\lancedb
 
 `--gpu-layers auto` abilita l'offload quando disponibile; è possibile passare
 un numero intero per forzare i layer. Docling preserva titoli, paragrafi e liste;
-il chunking usa 900 token con overlap automatico del 15%.
+il chunking usa 900 token con overlap automatico del 15%. Le sezioni da almeno
+1 MB usano il line chunker per evitare il comportamento superlineare di HybridChunker.
 Formati supportati: PDF, Markdown, testo, reStructuredText, Word (`.doc`, `.docx`),
 Excel (`.xls`, `.xlsx`), PowerPoint (`.ppt`, `.pptx`) e OpenDocument
 (`.odt`, `.ods`, `.odp`).
 
-Gli ingest successivi elaborano solo file nuovi o modificati e disattivano quelli
-rimossi dalla directory. Un errore di embedding lascia ricercabile l'ultima versione
-completa. La ricerca `hybrid` usa automaticamente il reranker Qwen3 Q8 solo quando
+Gli ingest successivi elaborano solo file nuovi o modificati ed eliminano dal database
+quelli rimossi dalla directory. Un errore di embedding lascia ricercabile l'ultima versione
+completa; l'indice FTS esistente viene aggiornato incrementalmente. La ricerca
+`hybrid` usa automaticamente il reranker Qwen3 Q8 solo quando
 i primi risultati FTS e vector non concordano; `--no-rerank` lo disabilita e
 `--always-rerank` lo forza. I default sono 12 candidati, 1024 token per documento e
 contesto 2048. `--flash-attn` permette il confronto sul backend Metal.
@@ -118,6 +120,29 @@ Poi invia le query a `http://127.0.0.1:8181/query` con JSON
 `{"query":"Ecolabel","rerank":false}`. `GET /collections` restituisce le collezioni attive,
 mentre `GET /health` verifica che il server sia attivo; termina con `Ctrl-C`.
 
+## Collection registry e update
+
+Le collection possono essere registrate senza indicizzare subito i file. Il registro
+predefinito è `index.yml` (JSON valido anche come YAML), e contiene percorso e filtro:
+
+```powershell
+uv run python -m src.document_indexer collection add .\corpus `
+  --name italia --pattern "**/*.md"
+uv run python -m src.document_indexer collection list
+uv run python -m src.document_indexer update --collection italia `
+  --db-path data\lancedb
+uv run python -m src.document_indexer collection delete italia `
+  --db-path data\lancedb
+uv run python -m src.document_indexer document add .\corpus\nota.md `
+  --collection italia --db-path data\lancedb
+uv run python -m src.document_indexer document delete <document-id> `
+  --db-path data\lancedb
+```
+
+`collection add` non copia né modifica i file, ma indicizza subito quelli che
+rispettano il pattern, come QMD. `update` sincronizza le collection registrate;
+`collection delete` rimuove la registrazione e i documenti indicizzati.
+
 `POST /query` accetta:
 
 ```json
@@ -137,12 +162,25 @@ adattivo, che è il default.
 
 Gli altri endpoint sono:
 
+- `GET /collections`: collection registrate in `index.yml`.
+- `GET /collections/{name}`: dettaglio della collection.
+- `POST /collections`: registra e indicizza
+  `{"name":"italia","path":"...","pattern":"**/*.md"}`.
+- `PUT /collections/{name}`: aggiorna percorso o filtro.
+- `DELETE /collections/{name}`: elimina la registrazione e i documenti indicizzati.
 - `GET /documents?collection=italia`: elenco dei documenti attivi.
 - `GET /documents/{id}`: metadati e testo ricostruito dai chunk.
+- `POST /documents` con JSON indicizza un file locale, ad esempio
+  `{"path":"C:\\docs\\nota.md","collection":"italia"}`; con multipart supporta
+  il drag-and-drop.
+- `DELETE /documents/{id}`: elimina un documento e i suoi chunk.
 - `GET /status`: conteggi di documenti, chunk e collezioni.
 - `POST /feedback`: riceve `{"document_id":"...","relevant":true,"query":"..."}`.
-- `POST /ingest`: multipart con uno o più campi `files` e il campo
-  `collection`; accetta PDF, Markdown, testo e reStructuredText.
+- `POST /ingest` con JSON avvia l'update delle collection registrate; con multipart
+  mantiene l'ingest drag-and-drop tramite i campi `files` e `collection`.
+- `POST /update`: alias JSON per avviare l'update, opzionalmente filtrato da
+  `{"collections":["italia"]}`.
+- `POST /documents`: alias multipart per aggiungere documenti direttamente.
 
 Il benchmark incluso misura recall, reciprocal rank e latenza sulle query note:
 

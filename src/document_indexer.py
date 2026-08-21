@@ -2,6 +2,8 @@
 # pyright: reportMissingTypeStubs=false, reportUnknownVariableType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false, reportCallIssue=false, reportArgumentType=false
 
 import argparse
+import bisect
+import fnmatch
 import json
 import logging
 import math
@@ -9,8 +11,10 @@ import re
 import sys
 import tempfile
 import time
+from collections import Counter
 from email import policy
 from email.parser import BytesParser
+from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,16 +24,13 @@ from urllib.parse import parse_qs, unquote, urlsplit
 import lancedb
 from lancedb.index import FTS
 from llama_cpp import LLAMA_POOLING_TYPE_RANK
-from docling.datamodel.base_models import InputFormat
-from docling.document_converter import DocumentConverter
-from docling_core.transforms.chunker.hybrid_chunker import HybridChunker
-
 from src.indexer_support import (
     DEFAULT_EMBEDDING_MODEL,
     DEFAULT_RERANKER_MODEL,
     DOCUMENT_SUFFIXES,
     EMBEDDING_BATCH_SIZE,
     DOCLING_DOCUMENT_SUFFIXES,
+    TEXT_FTS_MIGRATION_SQL,
     InputDocument,
     chunks_schema,
     documents_schema,
@@ -39,6 +40,7 @@ from src.indexer_support import (
     rows,
     upsert,
     load_model,
+    normalize_tech_tokens,
     read_input_documents,
 )
 from src.logging_utils import clear_progress, configure_colored_logging, update_progress
@@ -50,6 +52,7 @@ LOGGER = logging.getLogger("document-indexer")
 class DocumentIndexerConfig:
     model_path: Path = Path(DEFAULT_EMBEDDING_MODEL)
     db_path: Path = Path("data/lancedb")
+    index_path: Path = Path("index.yml")
     chunk_size: int = 900
     chunk_overlap: int | None = None
     batch_size: int = EMBEDDING_BATCH_SIZE
@@ -59,6 +62,7 @@ class DocumentIndexerConfig:
     rerank_max_tokens: int = 1024
     reranker_context: int = 2048
     flash_attn: bool = False
+    min_score: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -91,7 +95,8 @@ RERANK_SYSTEM = (
     "Judge whether the Document meets the requirements based on the Query and the "
     'Instruct provided. Note that the answer can only be "yes" or "no".'
 )
-CHUNKER_VERSION = "articles-overlap-v2"
+CHUNKER_VERSION = "adaptive-overlap-v3"
+LARGE_SECTION_CHARS = 1_000_000
 ARTICLE_HEADING = re.compile(r"(?m)^[ \t]*(Article[ \t]+\d+[A-Za-z]?)[ \t]*$")
 OUTPUT_FIELDS = (
     "id", "document_id", "collection", "title", "relative_path", "chunk_index",
@@ -100,14 +105,73 @@ OUTPUT_FIELDS = (
 )
 
 
+def _read_collection_index(path: Path) -> dict[str, Row]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"Unable to read collection index {path}: {error}") from error
+    collections = payload.get("collections") if isinstance(payload, dict) else None
+    if not isinstance(collections, dict):
+        raise ValueError(f"Invalid collection index {path}")
+    result: dict[str, Row] = {}
+    for name, entry in collections.items():
+        if (isinstance(name, str) and isinstance(entry, dict)
+                and isinstance(entry.get("path"), str)
+                and isinstance(entry.get("pattern"), str)):
+            result[name] = {
+                "name": name, "path": entry["path"], "pattern": entry["pattern"],
+            }
+    if len(result) != len(collections):
+        raise ValueError(f"Invalid collection entry in {path}")
+    return result
+
+
+def _write_collection_index(path: Path, collections: dict[str, Row]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"collections": {name: {
+        "path": entry["path"], "pattern": entry["pattern"],
+    } for name, entry in sorted(collections.items())}}
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8")
+
+
 def lexicalize_query(query: str) -> str:
-    tokens = [token.text for token in lancedb.tokenize(query, **FTS_OPTIONS)]
+    tokens = [token.text for token in lancedb.tokenize(
+        normalize_tech_tokens(query), **FTS_OPTIONS)]
     lexical = " ".join(token for token in tokens if token.casefold() not in LEXICAL_STOP_WORDS)
     return lexical or query
 
 
-def _create_fts(table: Any) -> None:
-    table.create_index("text", config=FTS(with_position=True, **FTS_OPTIONS), replace=True)
+def _dedup_by_document(results: list[Row]) -> list[Row]:
+    seen: set[str] = set()
+    return [row for row in results
+            if not (str(row["document_id"]) in seen or seen.add(str(row["document_id"])))]
+
+
+_TOC_LINE = re.compile(r"^\s*(.{0,100}?\.{4,}\s*\d+|\d{1,4})\s*$")
+
+
+def _is_boilerplate(text: str) -> bool:
+    # ponytail: TOC heuristic only — dot-leader/page-number lines.
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        return True
+    toc_lines = sum(1 for line in lines if _TOC_LINE.match(line))
+    return toc_lines / len(lines) > 0.3
+
+
+def _create_fts(table: Any, *, rebuild: bool = False) -> None:
+    has_fts = any(index.index_type == "FTS" for index in table.list_indices())
+    if "text_fts" not in table.schema.names:
+        table.add_columns({"text_fts": TEXT_FTS_MIGRATION_SQL})
+        has_fts = False  # old index was on "text"; force rebuild on text_fts
+    if rebuild or not has_fts:
+        table.create_index(
+            "text_fts", config=FTS(with_position=True, **FTS_OPTIONS), replace=True)
+    else:
+        table.optimize()
 
 
 def load_reranker_model(path: Path, gpu_layers: str | int = "auto",
@@ -232,7 +296,7 @@ def _pdf_sections(text: str) -> list[tuple[int, int, str]]:
     return sections
 
 
-def _whitespace_position(text: str, needle: str, start: int, end: int) -> int:
+def _whitespace_map(text: str, start: int, end: int) -> tuple[str, list[int]]:
     collapsed: list[str] = []
     offsets: list[int] = []
     whitespace: int | None = None
@@ -248,18 +312,27 @@ def _whitespace_position(text: str, needle: str, start: int, end: int) -> int:
             whitespace = None
         collapsed.append(character)
         offsets.append(offset)
-    match = "".join(collapsed).find(" ".join(needle.split()))
+    return "".join(collapsed), offsets
+
+
+def _whitespace_position(needle: str, normalized: tuple[str, list[int]],
+                         start: int, end: int) -> int:
+    text, offsets = normalized
+    match = text.find(" ".join(needle.split()), bisect.bisect_left(offsets, start),
+                      bisect.bisect_left(offsets, end))
     return offsets[match] if match >= 0 and offsets else -1
 
 
 def _chunk_position(text: str, needle: str, start: int, end: int,
-                    fallback: int, path: str) -> int:
+                    fallback: int, path: str,
+                    normalized: tuple[str, list[int]] | None = None) -> int:
+    normalized = normalized or _whitespace_map(text, start, end)
     position = text.find(needle, start, end)
     if position < 0:
-        position = _whitespace_position(text, needle, start, end)
+        position = _whitespace_position(needle, normalized, start, end)
     if position < 0:
         anchor = " ".join(needle.split()[:12])
-        position = _whitespace_position(text, anchor, start, end)
+        position = _whitespace_position(anchor, normalized, start, end)
         if position >= 0:
             LOGGER.info("phase=chunk-position-anchor document=%s position=%d", path, position)
     if position < 0:
@@ -271,52 +344,126 @@ def _chunk_position(text: str, needle: str, start: int, end: int,
 def _overlap_suffix(text: str, tokenizer: Any, max_tokens: int) -> str:
     if max_tokens <= 0 or not text:
         return ""
+    try:
+        encoded = tokenizer.get_tokenizer()(
+            text, add_special_tokens=False, return_offsets_mapping=True)
+        offsets = encoded["offset_mapping"]
+        if len(offsets) <= max_tokens:
+            return text
+        minimum_start = offsets[-max_tokens][0]
+        for pattern in (r"\n+|(?<=[.!?])\s+", r"\s+"):
+            match = re.compile(pattern).search(text, max(0, minimum_start - 1))
+            if match:
+                boundary = match.end()
+                if boundary >= minimum_start:
+                    return text[boundary:]
+        return text[minimum_start:]
+    except (AttributeError, KeyError, TypeError):
+        pass
+    if tokenizer.count_tokens(text) <= max_tokens:
+        return text
     for pattern in (r"\n+|(?<=[.!?])\s+", r"\s+"):
-        for match in re.finditer(pattern, text):
-            candidate = text[match.end():]
-            if candidate and tokenizer.count_tokens(candidate) <= max_tokens:
-                return candidate
-    return text if tokenizer.count_tokens(text) <= max_tokens else ""
+        boundaries = [match.end() for match in re.finditer(pattern, text)]
+        low, high, answer = 0, len(boundaries) - 1, None
+        while low <= high:
+            middle = (low + high) // 2
+            candidate = text[boundaries[middle]:]
+            if tokenizer.count_tokens(candidate) <= max_tokens:
+                answer, high = candidate, middle - 1
+            else:
+                low = middle + 1
+        if answer:
+            return answer
+    return ""
+
+
+def _pdf_text(path: Path) -> str:
+    # ponytail: text PDFs only; add OCR when scanned PDFs must be supported.
+    import pypdfium2 as pdfium
+    with pdfium.PdfDocument(path) as pdf:
+        return "\n\n".join(
+            pdf[index].get_textpage().get_text_range()
+            for index in range(len(pdf))
+        ).replace("\r\n", "\n").replace("\r", "\n").replace("\ufffe", "")
+
+
+@lru_cache(maxsize=8)
+def _docling_chunkers(max_tokens: int) -> tuple[Any, Any]:
+    from docling_core.transforms.chunker.hybrid_chunker import HybridChunker
+    from docling_core.transforms.chunker.line_chunker import LineBasedTokenChunker
+    from docling_core.transforms.chunker.tokenizer.huggingface import HuggingFaceTokenizer
+
+    model = "sentence-transformers/all-MiniLM-L6-v2"
+    try:
+        tokenizer = HuggingFaceTokenizer.from_pretrained(
+            model, max_tokens=max_tokens, local_files_only=True)
+    except OSError:
+        tokenizer = HuggingFaceTokenizer.from_pretrained(model, max_tokens=max_tokens)
+    hybrid = HybridChunker(tokenizer=tokenizer)
+    return hybrid, LineBasedTokenChunker(tokenizer=hybrid.tokenizer, prefix="")
 
 
 def chunk_documents(
     documents: list[InputDocument], chunk_size: int, overlap_tokens: int
 ) -> list[DocumentChunk]:
+    from dataclasses import replace
+    from docling.datamodel.base_models import InputFormat
+    from docling.document_converter import DocumentConverter
+
     converter = DocumentConverter()
-    chunker = HybridChunker()
-    docling_tokenizer: Any = chunker.tokenizer
-    docling_tokenizer.max_tokens = chunk_size - overlap_tokens
+    hybrid_chunker, line_chunker = _docling_chunkers(chunk_size - overlap_tokens)
+    docling_tokenizer: Any = hybrid_chunker.tokenizer
     chunks: list[DocumentChunk] = []
     update_progress("Chunking", 0, len(documents))
     for document_number, document in enumerate(documents, start=1):
         source = Path(document.collection_root) / document.relative_path
-        sections = (_pdf_sections(document.text) if source.suffix.lower() == ".pdf"
-                    else [(0, len(document.text), "")])
+        suffix = source.suffix.lower()
+        converted_document = None
+        if suffix == ".pdf":
+            source_text = document.text or _pdf_text(source)
+        elif suffix in DOCLING_DOCUMENT_SUFFIXES:
+            converted_document = converter.convert(source).document
+            source_text = converted_document.export_to_markdown()
+            source_text = source_text.replace("\r\n", "\n").replace(
+                "\r", "\n").replace("\ufffe", "")
+        else:
+            source_text = document.text
+            converted_document = converter.convert_string(
+                source_text, InputFormat.MD, name=source.stem).document
+        working_document = replace(document, text=source_text)
+        sections = (_pdf_sections(source_text) if suffix == ".pdf"
+                    else [(0, len(source_text), "")])
         document_chunks: list[Any] = []
         for section_start, section_end, markdown in sections:
             converted = (converter.convert_string(
-                markdown or document.text, InputFormat.MD, name=source.stem)
-                if source.suffix.lower() == ".pdf"
-                or source.suffix.lower() in DOCLING_DOCUMENT_SUFFIXES
-                else converter.convert(source))
-            section_chunks = list(chunker.chunk(converted.document))
+                markdown, InputFormat.MD, name=source.stem).document
+                if suffix == ".pdf" else converted_document)
+            section_length = len(markdown or source_text)
+            chunker = line_chunker if section_length >= LARGE_SECTION_CHARS else hybrid_chunker
+            LOGGER.info("phase=chunker-select document=%s chars=%d chunker=%s",
+                        document.relative_path, section_length,
+                        "line" if section_length >= LARGE_SECTION_CHARS else "hybrid")
+            section_chunks = list(chunker.chunk(converted))
+            normalized = _whitespace_map(source_text, section_start, section_end)
             previous_text = ""
             previous_position = section_start
             for chunk in section_chunks:
+                if _is_boilerplate(chunk.text):
+                    continue
                 search_start = section_start if not previous_text else previous_position + 1
                 chunk_position = _chunk_position(
-                    document.text, chunk.text, search_start, section_end,
-                    search_start, document.relative_path)
+                    source_text, chunk.text, search_start, section_end,
+                    search_start, document.relative_path, normalized)
                 overlap = _overlap_suffix(previous_text, docling_tokenizer, overlap_tokens)
                 text = chunker.contextualize(chunk)
                 stored_position = chunk_position
                 if overlap:
                     stored_position = _chunk_position(
-                        document.text, overlap, previous_position, chunk_position,
-                        chunk_position, document.relative_path)
+                        source_text, overlap, previous_position, chunk_position,
+                        chunk_position, document.relative_path, normalized)
                     text = f"{text[:-len(chunk.text)]}{overlap}\n{chunk.text}"
                 chunks.append(DocumentChunk(
-                    document, len(document_chunks), text, stored_position))
+                    working_document, len(document_chunks), text, stored_position))
                 document_chunks.append(chunk)
                 previous_text = chunk.text
                 previous_position = chunk_position
@@ -340,11 +487,14 @@ class DocumentIndexer:
             raise ValueError("rerank_max_tokens must be positive")
         if config.reranker_context < 1:
             raise ValueError("reranker_context must be positive")
+        if not 0 <= config.min_score <= 1:
+            raise ValueError("min_score must be between 0 and 1")
         self.config = config
         self._reranker: Any | None = None
 
     def index(
-        self, path: Path, model: Any | None = None, collection: str = "default"
+        self, path: Path, model: Any | None = None, collection: str = "default",
+        pattern: str | None = None,
     ) -> dict[str, int | str]:
         started = time.perf_counter()
         if not collection.strip():
@@ -353,6 +503,13 @@ class DocumentIndexer:
             raise FileNotFoundError(f"Document path not found: {path}")
         LOGGER.info("phase=scan path=%s", path)
         documents = read_input_documents(path)
+        if pattern is not None:
+            documents = [
+                document for document in documents
+                if fnmatch.fnmatchcase(document.relative_path, pattern)
+                or (pattern.startswith("**/")
+                    and fnmatch.fnmatchcase(document.relative_path, pattern[3:]))
+            ]
         if not documents:
             raise ValueError(f"No supported documents found: {path}")
         LOGGER.info("phase=scan-complete documents=%d", len(documents))
@@ -369,6 +526,7 @@ class DocumentIndexer:
             if "documents" in table_names
             else db.create_table("documents", schema=documents_schema())
         )
+        documents_table.delete("active = false")
         embedding_fingerprint = (
             f"{self.config.model_path.resolve()}|chunker={CHUNKER_VERSION}"
             f"|chunk_size={chunk_size}|chunk_overlap={chunk_overlap}"
@@ -380,12 +538,22 @@ class DocumentIndexer:
             row["id"]: row for row in documents_table.to_arrow().to_pylist()
         }
         chunks_table: Any | None = db.open_table("chunks") if "chunks" in table_names else None
+        if chunks_table is not None:
+            chunks_table.delete("active = false")
+        active_chunk_counts: Counter[str] = Counter()
+        if chunks_table is not None and document_ids:
+            ids = ",".join(repr(value) for value in document_ids.values())
+            where = f"active = true AND document_id IN ({ids})"
+            count = chunks_table.count_rows(where)
+            if count:
+                active_chunk_counts.update(
+                    row["document_id"] for row in chunks_table.search().where(
+                        where).select(["document_id"]).limit(count).to_list()
+                )
         pending_documents: list[InputDocument] = []
         for document in documents:
             existing = existing_documents.get(document_ids[document.id])
-            active_chunks = 0 if chunks_table is None else chunks_table.count_rows(
-                f"document_id = {document_ids[document.id]!r} AND active = true"
-            )
+            active_chunks = active_chunk_counts[document_ids[document.id]]
             unchanged = bool(
                 existing and existing.get("active")
                 and existing.get("content_hash") == document.content_hash
@@ -405,11 +573,11 @@ class DocumentIndexer:
                 if row.get("active") and row.get("collection") == collection
                 and row.get("collection_root") == root and row["id"] not in current_ids
             ]
-            upsert(documents_table, [{**row, "active": False} for row in deleted_rows])
-            if chunks_table is not None:
-                for row in deleted_rows:
-                    old_chunks = rows(chunks_table, f"document_id = {row['id']!r}")
-                    upsert(chunks_table, [{**chunk, "active": False} for chunk in old_chunks])
+            if deleted_rows:
+                ids = ",".join(repr(row["id"]) for row in deleted_rows)
+                if chunks_table is not None:
+                    chunks_table.delete(f"document_id IN ({ids})")
+                documents_table.delete(f"id IN ({ids})")
 
         LOGGER.info("phase=incremental-scan changed=%d unchanged=%d deleted=%d",
                     len(pending_documents), len(documents) - len(pending_documents),
@@ -443,6 +611,8 @@ class DocumentIndexer:
                 raise ValueError(
                     f"Existing LanceDB vector dimension is {current_dimension}, expected {dimension}"
                 )
+        if "text_fts" not in chunks_table.schema.names:
+            chunks_table.add_columns({"text_fts": TEXT_FTS_MIGRATION_SQL})
         LOGGER.info("phase=database-ready path=%s dimension=%d", self.config.db_path, dimension)
         chunk_started = time.perf_counter()
         chunks = chunk_documents(pending_documents, chunk_size, chunk_overlap)
@@ -516,6 +686,7 @@ class DocumentIndexer:
                     "total_chunks": total_chunks_by_document[chunk.document.id],
                     "position": chunk.position,
                     "text": chunk.text,
+                    "text_fts": normalize_tech_tokens(chunk.text),
                     "vector": vector,
                     "active": False,
                 }
@@ -533,7 +704,7 @@ class DocumentIndexer:
 
         active_documents: list[Row] = []
         active_chunks: list[Row] = []
-        obsolete_chunks: list[Row] = []
+        obsolete_chunk_ids: list[str] = []
         document_rows_by_id: dict[str, Row] = {
             document.id: row for document, row in zip(pending_documents, document_rows)
         }
@@ -543,13 +714,16 @@ class DocumentIndexer:
             if len(document_chunk_rows) == expected and expected:
                 active_documents.append({**document_rows_by_id[document.id], "active": True})
                 active_chunks.extend([{**row, "active": True} for row in document_chunk_rows])
-                obsolete_chunks.extend([
-                    {**row, "active": False}
-                    for row in old_chunks_by_document[document.id]
-                ])
-        upsert(documents_table, active_documents)
+                obsolete_chunk_ids.extend(
+                    str(row["id"]) for row in old_chunks_by_document[document.id])
         upsert(chunks_table, active_chunks)
-        upsert(chunks_table, obsolete_chunks)
+        upsert(documents_table, active_documents)
+        if obsolete_chunk_ids:
+            ids = ",".join(repr(value) for value in obsolete_chunk_ids)
+            chunks_table.delete(f"id IN ({ids})")
+        pending_ids = ",".join(
+            repr(document_ids[document.id]) for document in pending_documents)
+        chunks_table.delete(f"active = false AND document_id IN ({pending_ids})")
         fts_started = time.perf_counter()
         _create_fts(chunks_table)
         LOGGER.info("phase=fts-index-complete seconds=%.3f", time.perf_counter() - fts_started)
@@ -576,7 +750,7 @@ class DocumentIndexer:
         if "chunks" not in db.list_tables().tables:
             raise ValueError("database is empty; ingest documents before rebuilding FTS")
         table: Any = db.open_table("chunks")
-        _create_fts(table)
+        _create_fts(table, rebuild=True)
         result: dict[str, int | str] = {
             "db_path": str(self.config.db_path),
             "indexed_chunks": table.count_rows(),
@@ -584,6 +758,80 @@ class DocumentIndexer:
         LOGGER.info("phase=fts-reindex-complete chunks=%d seconds=%.3f",
                     result["indexed_chunks"], time.perf_counter() - started)
         return result
+
+    def collections(self) -> list[Row]:
+        return list(_read_collection_index(self.config.index_path).values())
+
+    def add_collection(self, name: str, path: Path,
+                       pattern: str = "**/*.md") -> Row:
+        name = name.strip()
+        if not name:
+            name = path.resolve().name or "root"
+        if not path.is_dir():
+            raise ValueError(f"collection path must be a directory: {path}")
+        if not pattern.strip():
+            raise ValueError("collection pattern must not be empty")
+        collections = _read_collection_index(self.config.index_path)
+        if name in collections:
+            raise ValueError(f"collection already exists: {name}")
+        resolved_path = str(path.resolve())
+        if any(entry["path"] == resolved_path and entry["pattern"] == pattern
+               for entry in collections.values()):
+            raise ValueError(f"collection already exists for path and pattern: {resolved_path}")
+        entry = {"name": name, "path": resolved_path, "pattern": pattern}
+        collections[name] = entry
+        _write_collection_index(self.config.index_path, collections)
+        return entry
+
+    def remove_document(self, document_id: str) -> int:
+        db: Any = lancedb.connect(str(self.config.db_path))
+        if "documents" not in db.list_tables().tables:
+            return 0
+        documents_table = db.open_table("documents")
+        documents = rows(
+            documents_table, f"id = {document_id!r} AND active = true")
+        if not documents:
+            return 0
+        if "chunks" in db.list_tables().tables:
+            chunks_table = db.open_table("chunks")
+            chunks_table.delete(f"document_id = {document_id!r}")
+            _create_fts(chunks_table)
+        documents_table.delete(f"id = {document_id!r}")
+        return 1
+
+    def remove_collection(self, name: str) -> int:
+        collections = _read_collection_index(self.config.index_path)
+        if name not in collections:
+            raise ValueError(f"collection not found: {name}")
+        del collections[name]
+        _write_collection_index(self.config.index_path, collections)
+        db: Any = lancedb.connect(str(self.config.db_path))
+        if "documents" not in db.list_tables().tables:
+            return 0
+        documents_table = db.open_table("documents")
+        documents = rows(
+            documents_table, f"collection = {name!r} AND active = true")
+        if "chunks" in db.list_tables().tables:
+            chunks_table = db.open_table("chunks")
+            chunks_table.delete(f"collection = {name!r}")
+            _create_fts(chunks_table)
+        documents_table.delete(f"collection = {name!r}")
+        return len(documents)
+
+    def update_collections(self, names: list[str] | None = None,
+                           model: Any | None = None) -> list[dict[str, Any]]:
+        collections = _read_collection_index(self.config.index_path)
+        selected = names or sorted(collections)
+        results = []
+        for name in selected:
+            entry = collections.get(name)
+            if entry is None:
+                raise ValueError(f"collection not found: {name}")
+            results.append(self.index(
+                Path(entry["path"]), model=model, collection=name,
+                pattern=entry["pattern"],
+            ))
+        return results
 
     def list_collections(self) -> list[str]:
         db: Any = lancedb.connect(str(self.config.db_path))
@@ -686,9 +934,12 @@ class DocumentIndexer:
         where = " AND ".join(filters)
 
         def enrich(results: list[Row]) -> list[Row]:
-            documents = ({row["id"]: row for row in db.open_table(
-                "documents").to_arrow().to_pylist()}
-                if "documents" in db.list_tables().tables else {})
+            document_ids = sorted({str(row["document_id"]) for row in results})
+            documents: dict[str, Row] = {}
+            if document_ids and "documents" in db.list_tables().tables:
+                values = ",".join(repr(value) for value in document_ids)
+                documents = {row["id"]: row for row in rows(
+                    db.open_table("documents"), f"id IN ({values})")}
             enriched: list[Row] = []
             for result in results:
                 document = documents.get(result["document_id"], {})
@@ -724,6 +975,7 @@ class DocumentIndexer:
             ]
             LOGGER.info("phase=fts-search-complete candidates=%d seconds=%.3f",
                         len(text_results), time.perf_counter() - fts_started)
+            text_results = _dedup_by_document(text_results)
             if mode == "fts":
                 return enrich(text_results[:top_k])
         embedding_started = time.perf_counter()
@@ -745,6 +997,7 @@ class DocumentIndexer:
         ]
         LOGGER.info("phase=vector-search-complete candidates=%d seconds=%.3f",
                     len(vector_results), time.perf_counter() - vector_started)
+        vector_results = _dedup_by_document(vector_results)
         if mode == "vector":
             return enrich(vector_results[:top_k])
         fusion_started = time.perf_counter()
@@ -761,8 +1014,9 @@ class DocumentIndexer:
                     fused[key].update({name: result.get(name) for name in (
                         rank_field, "_fts_score", "_vector_distance") if result.get(name) is not None})
                 scores[key] = scores.get(key, 0.0) + weight / (60 + rank)
-        candidates = [{**fused[key], "_hybrid_score": scores[key]}
-                      for key in sorted(scores, key=scores.get, reverse=True)]
+        candidates = _dedup_by_document(
+            [{**fused[key], "_hybrid_score": scores[key]}
+             for key in sorted(scores, key=scores.get, reverse=True)])
         LOGGER.info("phase=fusion-complete candidates=%d seconds=%.3f",
                     len(candidates), time.perf_counter() - fusion_started)
         policy = "auto" if rerank is None else "always" if rerank else "never"
@@ -799,6 +1053,9 @@ class DocumentIndexer:
                               for candidate, score in zip(candidates, rerank_scores)]
                 candidates.sort(key=lambda row: (row["_rerank_score"],
                                                   row["_hybrid_score"]), reverse=True)
+                if self.config.min_score > 0:
+                    candidates = [row for row in candidates
+                                  if row["_rerank_score"] >= self.config.min_score]
                 LOGGER.info("phase=rerank-complete candidates=%d seconds=%.3f",
                             len(candidates), time.perf_counter() - rerank_started)
             except Exception as error:
@@ -897,7 +1154,16 @@ def _run_server(indexer: DocumentIndexer, args: Any) -> None:
         def do_GET(self) -> None:
             parsed = urlsplit(self.path)
             if parsed.path == "/collections":
-                self._send(200, {"collections": indexer.list_collections()})
+                self._send(200, {"collections": indexer.collections()})
+                return
+            if parsed.path.startswith("/collections/"):
+                name = unquote(parsed.path[len("/collections/"):])
+                collection = next(
+                    (entry for entry in indexer.collections() if entry["name"] == name), None)
+                if collection is None:
+                    self._send(404, {"error": "collection not found"})
+                else:
+                    self._send(200, collection)
                 return
             if parsed.path == "/documents":
                 collection = parse_qs(parsed.query).get("collection", [None])[0]
@@ -926,9 +1192,57 @@ def _run_server(indexer: DocumentIndexer, args: Any) -> None:
                 "reranker_model_loaded": indexer._reranker is not None,
             })
 
+        def do_DELETE(self) -> None:
+            try:
+                path = urlsplit(self.path).path
+                if path.startswith("/documents/"):
+                    document_id = unquote(path[len("/documents/"):])
+                    if not indexer.remove_document(document_id):
+                        self._send(404, {"error": "document not found"})
+                    else:
+                        self._send(200, {"deleted": True, "document_id": document_id})
+                    return
+                if path.startswith("/collections/"):
+                    name = unquote(path[len("/collections/"):])
+                    deleted = indexer.remove_collection(name)
+                    self._send(200, {"deleted": True, "collection": name,
+                                     "documents": deleted})
+                    return
+                self._send(404, {"error": "not found"})
+            except (OSError, ValueError, RuntimeError) as error:
+                self._send(400, {"error": str(error)})
+
         def do_POST(self) -> None:
             try:
                 path = urlsplit(self.path).path
+                if path == "/collections":
+                    payload = self._json_body()
+                    name = payload.get("name")
+                    collection_path = payload.get("path")
+                    pattern = payload.get("pattern", "**/*.md")
+                    if name is not None and not isinstance(name, str):
+                        raise ValueError("'name' must be a string")
+                    if not isinstance(collection_path, str):
+                        raise ValueError("'path' must be a string")
+                    if not isinstance(pattern, str):
+                        raise ValueError("'pattern' must be a string")
+                    entry = indexer.add_collection(
+                        name or "", Path(collection_path), pattern)
+                    self._send(201, {
+                        "collection": entry,
+                        "results": indexer.update_collections(
+                            [entry["name"]], embedding_model),
+                    })
+                    return
+                if path == "/update":
+                    payload = self._json_body()
+                    names = payload.get("collections")
+                    if names is not None and (
+                            not isinstance(names, list)
+                            or not all(isinstance(value, str) for value in names)):
+                        raise ValueError("'collections' must be an array of strings")
+                    self._send(200, {"results": indexer.update_collections(names, embedding_model)})
+                    return
                 if path == "/feedback":
                     payload = self._json_body()
                     if not isinstance(payload.get("document_id"), str):
@@ -940,8 +1254,31 @@ def _run_server(indexer: DocumentIndexer, args: Any) -> None:
                                 payload.get("query"))
                     self._send(202, {"accepted": True})
                     return
-                if path == "/ingest":
+                if path in {"/ingest", "/documents"}:
                     content_type = self.headers.get("Content-Type", "")
+                    if path == "/documents" and content_type.startswith("application/json"):
+                        payload = self._json_body()
+                        source_path = payload.get("path")
+                        collection = payload.get("collection", "default")
+                        if not isinstance(source_path, str) or not source_path.strip():
+                            raise ValueError("'path' must be a non-empty string")
+                        if not isinstance(collection, str) or not collection.strip():
+                            raise ValueError("'collection' must be a non-empty string")
+                        result = indexer.index(
+                            Path(source_path), model=embedding_model, collection=collection)
+                        self._send(201, result)
+                        return
+                    if path == "/ingest" and content_type.startswith("application/json"):
+                        payload = self._json_body()
+                        names = payload.get("collections")
+                        if names is not None and (
+                                not isinstance(names, list)
+                                or not all(isinstance(value, str) for value in names)):
+                            raise ValueError("'collections' must be an array of strings")
+                        self._send(200, {
+                            "results": indexer.update_collections(names, embedding_model)
+                        })
+                        return
                     if not content_type.startswith("multipart/form-data"):
                         raise ValueError("Content-Type must be multipart/form-data")
                     fields, uploads = self._multipart_body()
@@ -988,6 +1325,33 @@ def _run_server(indexer: DocumentIndexer, args: Any) -> None:
                 self._send(200, result)
             except (json.JSONDecodeError, OSError, TypeError, ValueError, RuntimeError) as error:
                 clear_progress()
+                self._send(400, {"error": str(error)})
+
+        def do_PUT(self) -> None:
+            try:
+                path = urlsplit(self.path).path
+                if not path.startswith("/collections/"):
+                    self._send(404, {"error": "not found"})
+                    return
+                name = unquote(path[len("/collections/"):])
+                payload = self._json_body()
+                collection_path = payload.get("path")
+                pattern = payload.get("pattern", "**/*.md")
+                if not isinstance(collection_path, str) or not isinstance(pattern, str):
+                    raise ValueError("'path' and 'pattern' must be strings")
+                collections = _read_collection_index(indexer.config.index_path)
+                if name not in collections:
+                    self._send(404, {"error": "collection not found"})
+                    return
+                if not Path(collection_path).is_dir():
+                    raise ValueError(f"collection path must be a directory: {collection_path}")
+                collections[name] = {
+                    "name": name, "path": str(Path(collection_path).resolve()),
+                    "pattern": pattern,
+                }
+                _write_collection_index(indexer.config.index_path, collections)
+                self._send(200, collections[name])
+            except (json.JSONDecodeError, OSError, TypeError, ValueError, RuntimeError) as error:
                 self._send(400, {"error": str(error)})
 
         def log_message(self, format: str, *values: Any) -> None:
@@ -1068,8 +1432,11 @@ def _add_search_arguments(command: Any) -> None:
     rerank.add_argument("--always-rerank", action="store_true")
     command.add_argument("--model", type=Path, default=Path(DEFAULT_EMBEDDING_MODEL))
     command.add_argument("--db-path", type=Path, default=Path("data/lancedb"))
+    command.add_argument("--index-path", type=Path, default=Path("index.yml"))
     command.add_argument("--gpu-layers", default="auto")
     command.add_argument("--flash-attn", action="store_true")
+    command.add_argument("--min-score", type=float, default=0.0,
+                         help="drop reranked results below this score (0 disables)")
 
 
 def main() -> int:
@@ -1090,6 +1457,31 @@ def main() -> int:
     benchmark = subparsers.add_parser("benchmark")
     benchmark.add_argument("cases", type=Path)
     _add_search_arguments(benchmark)
+    update = subparsers.add_parser("update")
+    _add_search_arguments(update)
+    collection = subparsers.add_parser("collection")
+    collection_commands = collection.add_subparsers(dest="collection_command", required=True)
+    collection_add = collection_commands.add_parser("add")
+    collection_add.add_argument("path", type=Path)
+    collection_add.add_argument("--name")
+    collection_add.add_argument("--pattern", default="**/*.md")
+    collection_add.add_argument("--index-path", type=Path, default=Path("index.yml"))
+    collection_delete = collection_commands.add_parser("delete")
+    collection_delete.add_argument("name")
+    collection_delete.add_argument("--db-path", type=Path, default=Path("data/lancedb"))
+    collection_delete.add_argument("--index-path", type=Path, default=Path("index.yml"))
+    collection_list = collection_commands.add_parser("list")
+    collection_list.add_argument("--index-path", type=Path, default=Path("index.yml"))
+    document = subparsers.add_parser("document")
+    document_commands = document.add_subparsers(dest="document_command", required=True)
+    document_add = document_commands.add_parser("add")
+    document_add.add_argument("file", type=Path)
+    document_add.add_argument("--collection", default="default")
+    document_add.add_argument("--model", type=Path, default=Path(DEFAULT_EMBEDDING_MODEL))
+    document_add.add_argument("--db-path", type=Path, default=Path("data/lancedb"))
+    document_delete = document_commands.add_parser("delete")
+    document_delete.add_argument("id")
+    document_delete.add_argument("--db-path", type=Path, default=Path("data/lancedb"))
     reindex = subparsers.add_parser("reindex-fts")
     reindex.add_argument("--db-path", type=Path, default=Path("data/lancedb"))
     ingest.add_argument("--model", type=Path, default=Path(DEFAULT_EMBEDDING_MODEL))
@@ -1115,10 +1507,34 @@ def main() -> int:
             rerank_max_tokens=getattr(args, "rerank_max_tokens", 1024),
             reranker_context=getattr(args, "reranker_context", 2048),
             flash_attn=getattr(args, "flash_attn", False),
+            index_path=getattr(args, "index_path", Path("index.yml")),
+            min_score=getattr(args, "min_score", 0.0),
         )
         indexer = DocumentIndexer(config)
         if args.command == "ingest":
             result = indexer.index(args.file, collection=args.collection)
+        elif args.command == "collection":
+            if args.collection_command == "add":
+                entry = indexer.add_collection(args.name or "", args.path, args.pattern)
+                result = {
+                    "collection": entry,
+                    "results": indexer.update_collections(
+                        [entry["name"]], _preload_embedding_model(indexer, "vector")),
+                }
+            elif args.collection_command == "delete":
+                result = {"collection": args.name,
+                          "documents": indexer.remove_collection(args.name)}
+            else:
+                result = {"collections": indexer.collections()}
+        elif args.command == "document":
+            if args.document_command == "add":
+                result = indexer.index(args.file, collection=args.collection)
+            else:
+                result = {"document_id": args.id,
+                          "deleted": bool(indexer.remove_document(args.id))}
+        elif args.command == "update":
+            result = {"results": indexer.update_collections(
+                args.collection, _preload_embedding_model(indexer, args.mode))}
         elif args.command == "reindex-fts":
             result = indexer.reindex_fts()
         elif args.command == "shell":

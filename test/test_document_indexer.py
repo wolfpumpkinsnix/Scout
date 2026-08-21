@@ -1,4 +1,5 @@
 import io
+import json
 import logging
 import tempfile
 import unittest
@@ -179,6 +180,10 @@ class DocumentIndexerTests(unittest.TestCase):
             indexer = DocumentIndexer(DocumentIndexerConfig(db_path=root / "db"))
             with patch("src.document_indexer.chunk_documents", one_chunk_per_document):
                 indexer.index(source, FakeEmbeddingModel())
+            db = lancedb.connect(str(root / "db"))
+            chunks_table = db.open_table("chunks")
+            inactive = chunks_table.to_arrow().to_pylist()[0]
+            chunks_table.add([{**inactive, "id": "legacy-inactive", "active": False}])
             with patch("src.document_indexer.chunk_documents",
                        side_effect=AssertionError("must not chunk")), \
                     patch("src.document_indexer.load_embedding_model",
@@ -187,6 +192,8 @@ class DocumentIndexerTests(unittest.TestCase):
 
             self.assertEqual(result["unchanged"], 1)
             self.assertEqual(result["embedded"], 0)
+            self.assertEqual(lancedb.connect(str(root / "db")).open_table(
+                "chunks").count_rows(), 1)
 
     def test_chunk_size_changes_fingerprint_and_forces_reingest(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -201,6 +208,9 @@ class DocumentIndexerTests(unittest.TestCase):
                     db_path=db_path, chunk_size=11)).index(source, FakeEmbeddingModel())
             self.assertEqual(result["unchanged"], 0)
             self.assertEqual(result["embedded"], 1)
+            db = lancedb.connect(str(db_path))
+            self.assertEqual(db.open_table("documents").count_rows(), 1)
+            self.assertEqual(db.open_table("chunks").count_rows(), 1)
 
     def test_overlap_uses_natural_suffix_with_token_limit(self):
         tokenizer = SimpleNamespace(count_tokens=lambda text: len(text.split()))
@@ -209,6 +219,14 @@ class DocumentIndexerTests(unittest.TestCase):
             _overlap_suffix(text, tokenizer, 6),
             "Second sentence stays together. Final item.",
         )
+
+        offsets = [(match.start(), match.end())
+                   for match in __import__("re").finditer(r"\S+", text)]
+        underlying = Mock(return_value={"offset_mapping": offsets})
+        fast_tokenizer = SimpleNamespace(get_tokenizer=lambda: underlying)
+        self.assertEqual(_overlap_suffix(text, fast_tokenizer, 6),
+                         "Second sentence stays together. Final item.")
+        underlying.assert_called_once()
 
     def test_chunk_position_uses_prefix_when_docling_reformats_tail(self):
         source = ("Earlier text.\n8. Where the opinion confirms safeguards in this specific "
@@ -245,6 +263,7 @@ class DocumentIndexerTests(unittest.TestCase):
             self.assertEqual(result["failures"], 1)
             self.assertEqual([row["id"] for row in active_chunks], [old_id])
             self.assertEqual(document["content_hash"], old_hash)
+            self.assertEqual(db.open_table("chunks").count_rows(), 1)
 
     def test_directory_ingest_deactivates_deleted_files(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -269,6 +288,45 @@ class DocumentIndexerTests(unittest.TestCase):
             self.assertEqual(result["deleted"], 1)
             self.assertEqual([row["relative_path"] for row in active_documents], ["a.md"])
             self.assertEqual(len(active_chunks), 1)
+            self.assertEqual(db.open_table("documents").count_rows(), 1)
+            self.assertEqual(db.open_table("chunks").count_rows(), 1)
+
+    def test_collection_registry_updates_only_matching_files_and_can_delete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus = root / "corpus"
+            corpus.mkdir()
+            (corpus / "keep.md").write_text("keep", encoding="utf-8")
+            (corpus / "skip.txt").write_text("skip", encoding="utf-8")
+            indexer = DocumentIndexer(DocumentIndexerConfig(
+                db_path=root / "db", index_path=root / "index.yml"))
+            entry = indexer.add_collection("docs", corpus)
+            self.assertEqual(entry["pattern"], "**/*.md")
+            self.assertEqual(json.loads((root / "index.yml").read_text())["collections"]["docs"]["path"],
+                             str(corpus.resolve()))
+            with patch("src.document_indexer.chunk_documents", one_chunk_per_document):
+                result = indexer.update_collections(model=FakeEmbeddingModel())
+            self.assertEqual(result[0]["documents"], 1)
+            self.assertEqual(len(indexer.list_documents("docs")), 1)
+            self.assertEqual(indexer.remove_collection("docs"), 1)
+            self.assertEqual(indexer.collections(), [])
+            self.assertEqual(indexer.list_documents("docs"), [])
+            db = lancedb.connect(str(root / "db"))
+            self.assertEqual(db.open_table("documents").count_rows(), 0)
+            self.assertEqual(db.open_table("chunks").count_rows(), 0)
+
+    def test_tech_tokens_boilerplate_and_dedup(self):
+        from src.document_indexer import _dedup_by_document, _is_boilerplate
+        from src.indexer_support import normalize_tech_tokens
+        self.assertEqual(normalize_tech_tokens("C# e F# e C++ e .NET"),
+                         "csharp e fsharp e cpp e dotnet")
+        self.assertIn("csharp", lexicalize_query("Come funziona C#?"))
+        self.assertTrue(_is_boilerplate(
+            "Indice\n\nIntroduzione .......... 1\nCapitolo 1 ........ 5\n2"))
+        self.assertFalse(_is_boilerplate("# Article 33\n\n1. First item"))
+        rows = [{"document_id": "a", "id": "1"}, {"document_id": "a", "id": "2"},
+                {"document_id": "b", "id": "3"}]
+        self.assertEqual([row["id"] for row in _dedup_by_document(rows)], ["1", "3"])
 
     def test_lexical_query_keeps_meaningful_terms_and_references(self):
         italian = lexicalize_query(
@@ -291,19 +349,27 @@ class DocumentIndexerTests(unittest.TestCase):
                 "position": 0, "vector": [1.0, 0.0], "active": True,
             }
             table.add([
-                {**base, "id": "it", "text": "comunità energetica e cittadini"},
-                {**base, "id": "en", "text": "renewable energy community citizens"},
+                {**base, "id": "it", "text": "comunità energetica e cittadini",
+                 "text_fts": "comunità energetica e cittadini"},
+                {**base, "id": "en", "text": "renewable energy community citizens",
+                 "text_fts": "renewable energy community citizens"},
             ])
             _create_fts(table)
+            table.add([{**base, "id": "new", "text": "another indexed row",
+                        "text_fts": "another indexed row"}])
+            self.assertGreater(table.list_indices()[0].num_unindexed_rows, 0)
+            _create_fts(table)
+            self.assertEqual(table.list_indices()[0].num_unindexed_rows, 0)
             indexer = DocumentIndexer(DocumentIndexerConfig(db_path=Path(directory) / "db"))
             self.assertEqual(indexer.search("comunità cittadini", mode="fts")[0]["id"], "it")
             self.assertEqual(indexer.search("renewable citizens", mode="fts")[0]["id"], "en")
 
     def test_hybrid_uses_backend_pool_rrf_dedup_and_compact_output(self):
-        fts = [{"id": f"f{i}", "document_id": "d", "collection": "c", "text": str(i),
-                "chunk_index": i, "total_chunks": 20, "position": i, "_score": float(i)}
+        fts = [{"id": f"f{i}", "document_id": f"d{i}", "collection": "c",
+                "text": str(i), "chunk_index": i, "total_chunks": 20, "position": i,
+                "_score": float(i)}
                for i in range(20)]
-        vector = [{"id": "f19" if i == 19 else f"v{i}", "document_id": "d",
+        vector = [{"id": "f19" if i == 19 else f"v{i}", "document_id": f"v{i}",
                    "collection": "c", "text": str(i), "chunk_index": i,
                    "total_chunks": 20, "position": i, "_distance": i / 100}
                   for i in range(20)]
@@ -319,8 +385,8 @@ class DocumentIndexerTests(unittest.TestCase):
         self.assertGreater(results[0]["_hybrid_score"], 2 / 61)
 
     def test_top_k_above_twenty_expands_both_candidate_pools(self):
-        values = [{"id": str(i), "document_id": "d", "collection": "c", "text": str(i),
-                   "chunk_index": i, "total_chunks": 25, "position": i,
+        values = [{"id": str(i), "document_id": f"d{i}", "collection": "c",
+                   "text": str(i), "chunk_index": i, "total_chunks": 25, "position": i,
                    "_score": 25 - i, "_distance": i / 100} for i in range(25)]
         table = FakeTable(values, values)
         with patch("src.document_indexer.lancedb.connect", return_value=FakeDb(table)):
@@ -349,7 +415,7 @@ class DocumentIndexerTests(unittest.TestCase):
 
     def test_reranker_caps_candidates_and_document_tokens(self):
         values = [
-            {"id": str(i), "document_id": "d", "collection": "c",
+            {"id": str(i), "document_id": f"d{i}", "collection": "c",
              "text": "x" * 100 + str(i), "chunk_index": i, "total_chunks": 5,
              "position": i, "_score": 5 - i, "_distance": i / 10}
             for i in range(5)
@@ -397,7 +463,7 @@ class DocumentIndexerTests(unittest.TestCase):
 
     def test_hybrid_reranks_and_missing_model_suggests_download(self):
         values = [
-            {"id": str(i), "document_id": "d", "collection": "c", "text": str(i),
+            {"id": str(i), "document_id": f"d{i}", "collection": "c", "text": str(i),
              "chunk_index": i, "total_chunks": 2, "position": i,
              "_score": 2 - i, "_distance": i / 10}
             for i in range(2)
@@ -415,7 +481,7 @@ class DocumentIndexerTests(unittest.TestCase):
 
     def test_auto_rerank_skips_agreeing_rankings_and_missing_model(self):
         values = [
-            {"id": str(i), "document_id": "d", "collection": "c", "text": str(i),
+            {"id": str(i), "document_id": f"d{i}", "collection": "c", "text": str(i),
              "chunk_index": i, "total_chunks": 2, "position": i,
              "_score": 2 - i, "_distance": i / 10}
             for i in range(2)
@@ -495,22 +561,45 @@ class DocumentIndexerTests(unittest.TestCase):
     def test_office_and_open_document_formats_are_converted_to_markdown(self):
         suffixes = (".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
                     ".odt", ".ods", ".odp")
-        converted = SimpleNamespace(document=SimpleNamespace(
-            export_to_markdown=lambda: "# Report\r\n\r\n1. Item\ufffe"))
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for suffix in suffixes:
                 (root / f"sample{suffix}").write_bytes(b"binary")
-            with patch("docling.document_converter.DocumentConverter") as converter:
-                converter.return_value.convert.return_value = converted
-                documents = read_input_documents(root)
+            documents = read_input_documents(root)
 
             self.assertEqual({Path(item.relative_path).suffix for item in documents},
                              set(suffixes))
-            self.assertTrue(all(item.text == "# Report\n\n1. Item" for item in documents))
-            chunks = chunk_documents([documents[1]], 50, 8)
+            self.assertTrue(all(not item.text for item in documents))
+            from docling.datamodel.base_models import InputFormat
+            from docling.document_converter import DocumentConverter
+            converted = DocumentConverter().convert_string(
+                "# Report\n\n1. Item", InputFormat.MD, name="sample")
+            with patch("docling.document_converter.DocumentConverter") as converter:
+                converter.return_value.convert.return_value = converted
+                chunks = chunk_documents([documents[1]], 50, 8)
+                converter.return_value.convert.assert_called_once()
             self.assertTrue(any("Report" in chunk.text and "1. Item" in chunk.text
                                 for chunk in chunks))
+
+    def test_large_sections_use_line_chunker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "large.md"
+            source.write_text("# Title\n\nBody", encoding="utf-8")
+            document = InputDocument(source.read_text(), directory, source.name, "hash")
+            with patch("src.document_indexer.LARGE_SECTION_CHARS", 1), \
+                    self.assertLogs("document-indexer", level="INFO") as logs:
+                chunks = chunk_documents([document], 50, 8)
+        self.assertTrue(chunks)
+        self.assertTrue(any("chunker=line" in line for line in logs.output))
+
+    def test_text_documents_chunk_from_loaded_content(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "document.md"
+            source.write_text("# Loaded\n\nContent in memory.", encoding="utf-8")
+            document = read_input_documents(source)[0]
+            source.unlink()
+            chunks = chunk_documents([document], 50, 8)
+        self.assertTrue(any("Content in memory" in chunk.text for chunk in chunks))
 
     def test_vector_and_fts_never_load_reranker(self):
         values = [{"id": "1", "document_id": "d", "collection": "c", "text": "query",

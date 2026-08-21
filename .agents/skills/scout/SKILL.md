@@ -96,6 +96,25 @@ Endpoints:
   query for ranking feedback.
 - `POST /ingest`: accepts multipart `files` plus a `collection` field for
   drag-and-drop ingestion of one or more supported documents.
+- `GET/POST/PUT/DELETE /collections[/{name}]`: manage the registered collection
+  paths and file patterns in `index.yml`; `POST` also ingests matching files.
+- `POST /update` (or JSON `POST /ingest`): ingest registered collections, optionally
+  filtered with `{"collections":["italia"]}`.
+- `DELETE /documents/{id}`: deactivate a document and its chunks.
+- `POST /documents` with JSON `{path, collection}` indexes an existing local file;
+  multipart remains available for drag-and-drop uploads.
+
+Manage the registry from the CLI:
+
+```powershell
+uv run python -m src.document_indexer collection add .\corpus `
+  --name italia --pattern "**/*.md"
+uv run python -m src.document_indexer update --collection italia
+uv run python -m src.document_indexer collection delete italia
+```
+
+The default `index.yml` uses JSON syntax, which is valid YAML, so the feature stays
+stdlib-only.
 
 `rerank` can be `true`, `false`, or `null`. Missing or `null` uses adaptive
 reranking, the default. The server binds to `127.0.0.1:8181`; use `--host`

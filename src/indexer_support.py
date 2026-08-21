@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,6 +20,7 @@ DOCLING_DOCUMENT_SUFFIXES = {
     ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".odt", ".ods", ".odp",
 }
 DOCUMENT_SUFFIXES = {".md", ".markdown", ".txt", ".rst", ".pdf"} | DOCLING_DOCUMENT_SUFFIXES
+BINARY_DOCUMENT_SUFFIXES = {".pdf"} | DOCLING_DOCUMENT_SUFFIXES
 
 pa = cast(Any, pa)
 
@@ -35,6 +37,23 @@ class InputDocument:
         return hashlib.sha256(
             f"{self.collection_root}\0{self.relative_path}".encode()
         ).hexdigest()
+
+
+# FTS tokenizers split on symbols, so C# indexes as "c" and is unfindable.
+# Map tech tokens to plain words, identically at index (SQL migration) and
+# query time. Keep the two expressions semantically in sync.
+_TECH_TOKEN_PATTERN = re.compile(r"(?i)c#|f#|c\+\+|\.net")
+_TECH_TOKEN_MAP = {"c#": "csharp", "f#": "fsharp", "c++": "cpp", ".net": "dotnet"}
+TEXT_FTS_MIGRATION_SQL = (
+    "regexp_replace(regexp_replace(regexp_replace(regexp_replace("
+    "text, '(?i)c#', 'csharp'), '(?i)f#', 'fsharp'), '(?i)c\\+\\+', 'cpp'),"
+    " '(?i)\\.net', 'dotnet')"
+)
+
+
+def normalize_tech_tokens(text: str) -> str:
+    return _TECH_TOKEN_PATTERN.sub(
+        lambda match: _TECH_TOKEN_MAP[match.group(0).lower()], text)
 
 
 def hash_value(value: object) -> str:
@@ -94,23 +113,15 @@ def _normalized_root(path: Path) -> str:
 
 def _input_document(path: Path, root: Path) -> InputDocument:
     suffix = path.suffix.lower()
-    if suffix == ".pdf":
-        # ponytail: text PDFs only; add OCR when scanned PDFs must be supported.
-        import pypdfium2 as pdfium
-        with pdfium.PdfDocument(path) as pdf:
-            text = "\n\n".join(
-                pdf[index].get_textpage().get_text_range()
-                for index in range(len(pdf))
-            )
-    elif suffix in DOCLING_DOCUMENT_SUFFIXES:
-        from docling.document_converter import DocumentConverter
-        text = DocumentConverter().convert(path).document.export_to_markdown()
+    if suffix in BINARY_DOCUMENT_SUFFIXES:
+        text = ""
+        content_hash = hashlib.sha256(path.read_bytes()).hexdigest()
     else:
         text = path.read_text(encoding="utf-8")
+        content_hash = hashlib.sha256(text.encode()).hexdigest()
     text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\ufffe", "")
     relative = path.resolve().relative_to(root.resolve()).as_posix()
-    return InputDocument(text, _normalized_root(root), relative,
-                         hashlib.sha256(text.encode()).hexdigest())
+    return InputDocument(text, _normalized_root(root), relative, content_hash)
 
 
 def read_input_documents(path: Path) -> list[InputDocument]:
@@ -145,6 +156,7 @@ def chunks_schema(dimension: int) -> Any:
         pa.field("embedding_fingerprint", pa.string()),
         pa.field("chunk_index", pa.int32()), pa.field("total_chunks", pa.int32()),
         pa.field("position", pa.int64()), pa.field("text", pa.string()),
+        pa.field("text_fts", pa.string()),
         pa.field("vector", pa.list_(pa.float32(), dimension)),
         pa.field("active", pa.bool_()),
     ])
