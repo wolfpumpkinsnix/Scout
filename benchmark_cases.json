@@ -1,0 +1,58 @@
+[
+  {
+    "query": "how can i declare a variable in c#?",
+    "expected_text": ["specify its type explicitly or use var"]
+  },
+  {
+    "query": "come dichiaro una variabile locale con tipo inferito?",
+    "expected_text": ["instructs the compiler to infer the type of the variable"]
+  },
+  {
+    "query": "cosa sono le params collections in C# 13?",
+    "expected_text": ["params modifier isn't limited to array types"]
+  },
+  {
+    "query": "how does asynchronous programming with async await work?",
+    "expected_text": ["avoid performance bottlenecks"]
+  },
+  {
+    "query": "spiegami l'ereditarietà in C#",
+    "expected_text": ["Inheritance is a feature of object"]
+  },
+  {
+    "query": "pattern matching con veicoli e pedaggi autostradali",
+    "expected_text": ["tolls and peak time pricing"]
+  },
+  {
+    "query": "come si gestiscono le eccezioni con try catch finally?",
+    "expected_text": ["unexpected or exceptional situations"]
+  },
+  {
+    "query": "errore CS0029 conversione da string a int",
+    "expected_text": ["CS0029"]
+  },
+  {
+    "query": "deconstruct a tuple into separate variables with var",
+    "expected_text": ["CS8132"]
+  },
+  {
+    "query": "cos'è la string interpolation in C#?",
+    "expected_text": ["String interpolation"]
+  },
+  {
+    "query": "come scrivere un analyzer che suggerisce const?",
+    "expected_text": ["MakeConstAnalyzer"]
+  },
+  {
+    "query": "quali tipi built-in offre C#?",
+    "expected_text": ["built-in types for common data"]
+  },
+  {
+    "query": "difference between implicit and explicit conversions",
+    "expected_text": ["Explicit conversions (casts)"]
+  },
+  {
+    "query": "come leggo gli argomenti da riga di comando in un programma .NET?",
+    "expected_text": ["long.Parse(args[0])"]
+  }
+]
