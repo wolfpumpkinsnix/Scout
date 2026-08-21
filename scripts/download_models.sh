@@ -36,10 +36,10 @@ case "$model" in
       "https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/resolve/main/qwen3-reranker-0.6b-q8_0.gguf?download=true"
     ;;
   all)
-    "$0" embedding
-    "$0" gemma
-    "$0" chat
-    "$0" reranker
+    bash "$0" embedding
+    bash "$0" gemma
+    bash "$0" chat
+    bash "$0" reranker
     ;;
   *)
     echo "Usage: $0 [embedding|gemma|chat|reranker|all]" >&2
