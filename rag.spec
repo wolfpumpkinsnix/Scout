@@ -8,7 +8,7 @@ a = Analysis(
     ['src/document_indexer.py'],
     pathex=[],
     binaries=llama_binaries,
-    datas=[],
+    datas=[('src/web', 'web')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
