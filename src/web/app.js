@@ -3,6 +3,12 @@ const question = document.getElementById("question");
 const form = document.getElementById("chat-form");
 const send = document.getElementById("send");
 const mode = document.getElementById("mode");
+const searchCollection = document.getElementById("search-collection");
+const uploadForm = document.getElementById("upload-form");
+const files = document.getElementById("files");
+const collection = document.getElementById("collection");
+const upload = document.getElementById("upload");
+const uploadStatus = document.getElementById("upload-status");
 
 function node(tag, className, text) {
   const element = document.createElement(tag);
@@ -44,6 +50,23 @@ function addFailure(text) {
   messages.append(message);
 }
 
+function setUploadStatus(text, failed = false) {
+  uploadStatus.textContent = text;
+  uploadStatus.classList.toggle("failure", failed);
+}
+
+async function loadSearchCollections() {
+  const response = await fetch("/collections");
+  const body = await response.json();
+  if (!response.ok) throw new Error(body.error || "Could not load collections");
+  searchCollection.replaceChildren(new Option("All collections", ""));
+  for (const entry of body.collections) {
+    if (typeof entry.name === "string" && entry.name) {
+      searchCollection.append(new Option(entry.name, entry.name));
+    }
+  }
+}
+
 async function setup() {
   try {
     const health = await fetch("/health").then(response => response.json());
@@ -52,6 +75,11 @@ async function setup() {
   } catch (error) {
     document.getElementById("status").textContent = "Server unavailable";
     addFailure("Could not reach the local Scout service.");
+  }
+  try {
+    await loadSearchCollections();
+  } catch (error) {
+    console.error(error);
   }
 }
 
@@ -67,7 +95,13 @@ form.addEventListener("submit", async event => {
     const response = await fetch("/query", {
       method:"POST",
       headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({ query, mode:mode.value, top_k:5, rerank:false }),
+      body:JSON.stringify({
+        query,
+        collections:searchCollection.value ? [searchCollection.value] : [],
+        mode:mode.value,
+        top_k:5,
+        rerank:false,
+      }),
     });
     const body = await response.json();
     if (!response.ok) throw new Error(body.error || "Search failed");
@@ -85,6 +119,32 @@ question.addEventListener("keydown", event => {
   if (event.key === "Enter" && !event.shiftKey) {
     event.preventDefault();
     form.requestSubmit();
+  }
+});
+
+uploadForm.addEventListener("submit", async event => {
+  event.preventDefault();
+  const selectedFiles = [...files.files];
+  const collectionName = collection.value.trim();
+  if (!selectedFiles.length || !collectionName) return;
+  const payload = new FormData();
+  for (const file of selectedFiles) payload.append("files", file);
+  payload.append("collection", collectionName);
+  upload.disabled = true;
+  upload.textContent = "Ingesting";
+  setUploadStatus(`Ingesting ${selectedFiles.length} file${selectedFiles.length === 1 ? "" : "s"}.`);
+  try {
+    const response = await fetch("/ingest", { method:"POST", body:payload });
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.error || "Ingestion failed");
+    files.value = "";
+    const chunks = body.results.reduce((total, result) => total + (result.chunks || 0), 0);
+    setUploadStatus(`Ingested ${body.files} file${body.files === 1 ? "" : "s"} into ${collectionName} (${chunks} chunks).`);
+  } catch (error) {
+    setUploadStatus(error.message || "Ingestion failed.", true);
+  } finally {
+    upload.disabled = false;
+    upload.textContent = "Ingest files";
   }
 });
 

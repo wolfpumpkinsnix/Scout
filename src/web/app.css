@@ -28,6 +28,13 @@ h1 { margin:0 0 9px; font-size:clamp(29px,5vw,46px); font-weight:normal; line-he
 .empty,.failure { color:var(--muted); font-size:16px; line-height:1.45; }
 .failure { color:var(--error); }
 footer { padding:16px clamp(20px,5vw,48px) 24px; border-top:1px solid var(--line); background:rgba(255,253,248,.72); }
+.upload-form { display:grid; gap:7px; margin-bottom:14px; padding-bottom:14px; border-bottom:1px solid var(--line); }
+.upload-fields { display:flex; flex-wrap:wrap; align-items:end; gap:10px; }
+.upload-fields label { display:grid; gap:5px; color:var(--muted); font-family:ui-monospace,monospace; font-size:12px; }
+.upload-fields input { max-width:250px; padding:7px 9px; color:var(--ink); background:var(--panel); border:1px solid var(--line); border-radius:3px; }
+.upload-fields input[type="file"] { max-width:300px; }
+.upload-fields button { min-height:34px; padding:0 14px; }
+.upload-status { min-height:18px; color:var(--muted); font-size:13px; line-height:1.4; }
 .controls { display:grid; grid-template-columns:1fr auto; gap:10px; align-items:end; }
 .settings { display:flex; gap:8px; align-items:center; color:var(--muted); font-family:ui-monospace,monospace; font-size:12px; }
 select { min-width:0; max-width:170px; padding:7px 9px; color:var(--ink); background:var(--panel); border:1px solid var(--line); border-radius:3px; }
@@ -36,4 +43,4 @@ textarea:focus,select:focus { outline:2px solid #9ccfbf; outline-offset:1px; }
 button { min-height:64px; padding:0 20px; color:#fff; background:var(--accent); border:0; border-radius:4px; cursor:pointer; font-weight:bold; }
 button:hover { background:var(--accent-dark); }
 button:disabled { cursor:wait; background:#7caea1; }
-@media (max-width:600px) { header { padding:18px 20px; } main { padding:24px 20px; } footer { padding:13px 20px 18px; } .controls { grid-template-columns:1fr; } button { min-height:44px; } .settings { overflow:auto; padding-bottom:2px; } }
+@media (max-width:600px) { header { padding:18px 20px; } main { padding:24px 20px; } footer { padding:13px 20px 18px; } .upload-fields { align-items:stretch; } .upload-fields label,.upload-fields input,.upload-fields input[type="file"] { width:100%; max-width:none; } .controls { grid-template-columns:1fr; } button { min-height:44px; } .settings { overflow:auto; padding-bottom:2px; } }

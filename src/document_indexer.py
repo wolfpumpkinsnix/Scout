@@ -1425,7 +1425,12 @@ def _run_server(indexer: DocumentIndexer, args: Any) -> None:
                 self._send_html(200, _swagger_html())
                 return
             if parsed.path == "/collections":
-                self._send(200, {"collections": indexer.collections()})
+                registered = indexer.collections()
+                registered_names = {entry["name"] for entry in registered}
+                self._send(200, {"collections": registered + [
+                    {"name": name} for name in indexer.list_collections()
+                    if name not in registered_names
+                ]})
                 return
             if parsed.path.startswith("/collections/"):
                 name = unquote(parsed.path[len("/collections/"):])
