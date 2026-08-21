@@ -15,6 +15,7 @@ from llama_cpp import Llama, llama_supports_gpu_offload
 
 DEFAULT_EMBEDDING_MODEL = "models/Qwen3-Embedding-0.6B-Q8_0.gguf"
 DEFAULT_RERANKER_MODEL = "models/qwen3-reranker-0.6b-q8_0.gguf"
+DEFAULT_CHAT_MODEL = "models/Qwen3-1.7B-Q4_K_M.gguf"
 EMBEDDING_BATCH_SIZE = 32
 DOCLING_DOCUMENT_SUFFIXES = {
     ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".odt", ".ods", ".odp",

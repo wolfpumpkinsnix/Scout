@@ -23,22 +23,26 @@ function addUser(text) {
   messages.append(message);
 }
 
-function addResults(results) {
+function addAnswer(body) {
   const message = node("article", "message");
-  message.append(node("div", "label", "Scout retrieval"));
-  if (!results.length) {
+  message.append(node("div", "label", "Scout answer"));
+  if (!body.answer) {
     message.append(node("div", "empty", "No indexed passage matched that question."));
   } else {
-    const list = node("div", "results");
-    for (const result of results) {
-      const card = node("article", "result");
-      const head = node("div", "result-head");
-      head.append(node("div", "result-title", result.title || result.relative_path || "Untitled document"));
-      head.append(node("div", "path", result.collection || ""));
-      card.append(head, node("div", "path", result.relative_path || ""), node("div", "excerpt", result.text || ""));
-      list.append(card);
+    message.append(node("div", "bubble", body.answer));
+    const sources = body.sources || [];
+    if (sources.length) {
+      const list = node("div", "results");
+      for (const [index, source] of sources.entries()) {
+        const card = node("article", "result");
+        const head = node("div", "result-head");
+        head.append(node("div", "result-title", `[${index + 1}] ${source.title || source.relative_path || "Untitled document"}`));
+        head.append(node("div", "path", source.collection || ""));
+        card.append(head, node("div", "path", source.relative_path || ""), node("div", "excerpt", source.text || ""));
+        list.append(card);
+      }
+      message.append(list);
     }
-    message.append(list);
   }
   messages.append(message);
   message.scrollIntoView({ block:"end", behavior:"smooth" });
@@ -46,7 +50,7 @@ function addResults(results) {
 
 function addFailure(text) {
   const message = node("article", "message");
-  message.append(node("div", "label", "Scout retrieval"), node("div", "failure", text));
+  message.append(node("div", "label", "Scout answer"), node("div", "failure", text));
   messages.append(message);
 }
 
@@ -90,9 +94,9 @@ form.addEventListener("submit", async event => {
   addUser(query);
   question.value = "";
   send.disabled = true;
-  send.textContent = "Searching";
+  send.textContent = "Asking";
   try {
-    const response = await fetch("/query", {
+    const response = await fetch("/ask", {
       method:"POST",
       headers:{"Content-Type":"application/json"},
       body:JSON.stringify({
@@ -100,17 +104,17 @@ form.addEventListener("submit", async event => {
         collections:searchCollection.value ? [searchCollection.value] : [],
         mode:mode.value,
         top_k:5,
-        rerank:false,
+        rerank:null,
       }),
     });
     const body = await response.json();
-    if (!response.ok) throw new Error(body.error || "Search failed");
-    addResults(body);
+    if (!response.ok) throw new Error(body.error || "Ask failed");
+    addAnswer(body);
   } catch (error) {
-    addFailure(error.message || "Search failed.");
+    addFailure(error.message || "Ask failed.");
   } finally {
     send.disabled = false;
-    send.textContent = "Search";
+    send.textContent = "Ask";
     question.focus();
   }
 });

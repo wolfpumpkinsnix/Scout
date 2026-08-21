@@ -145,6 +145,10 @@ uv run python -m src.document_indexer query "Ecolabel" `
 uv run python -m src.document_indexer query "Ecolabel" `
   --mode hybrid --always-rerank --db-path data\lancedb
 
+# genera una risposta dai chunk rilevanti con il modello chat Qwen3 1.7B
+uv run python -m src.document_indexer ask "Come si dichiara una variabile in C#?" `
+  --collection dotnet --db-path data\lancedb
+
 # ricostruisce solo l'indice testuale
 uv run python -m src.document_indexer reindex-fts --db-path data\lancedb
 
@@ -166,12 +170,23 @@ i primi risultati FTS e vector non concordano; `--no-rerank` lo disabilita e
 `--always-rerank` lo forza. I default sono 12 candidati, 1024 token per documento e
 contesto 2048. `--flash-attn` permette il confronto sul backend Metal.
 
+Il comando `ask` va oltre il retrieval: esegue la ricerca (con reranking adattivo),
+inserisce i chunk migliori nel prompt del modello chat Qwen3 1.7B e genera una
+risposta con citazioni numerate `[1]`, `[2]` corrispondenti alle fonti restituite.
+Il modello chat si scarica con `download_models` (target `chat`) e si carica lazy,
+come il reranker. Se le fonti superano il contesto (`--chat-context`, default 8192),
+i chunk vengono troncati o saltati; `--answer-max-tokens` (default 512) limita la
+risposta. `chat_model_path`, `chat_context` e `answer_max_tokens` sono modificabili
+a runtime tramite `config.json` o `PUT /config`.
+
 Per più query consecutive, `shell` carica subito l'embedding e carica il reranker al
-primo caso ambiguo, riutilizzandolo poi:
+primo caso ambiguo, riutilizzandolo poi; con il prefisso `/ask` la query genera
+anche la risposta:
 
 ```powershell
 uv run python -m src.document_indexer shell `
   --collection italia --db-path data\lancedb
+# query> /ask Come si dichiara una variabile in C#?
 ```
 
 Per mantenere i modelli caldi tra processi/client diversi, avvia il server locale:
@@ -182,7 +197,9 @@ uv run python -m src.document_indexer serve `
 ```
 
 Poi invia le query a `http://127.0.0.1:8181/query` con JSON
-`{"query":"Ecolabel","rerank":false}`. `GET /collections` restituisce le collezioni attive,
+`{"query":"Ecolabel","rerank":false}`; `POST /ask` accetta lo stesso payload e
+restituisce `{"query","answer","sources"}` con la risposta generata e le fonti.
+`GET /collections` restituisce le collezioni attive,
 mentre `GET /health` verifica che il server sia attivo. La documentazione interattiva
 è disponibile su `http://127.0.0.1:8181/docs`, con lo schema OpenAPI grezzo su
 `http://127.0.0.1:8181/openapi.json`. Termina il server con `Ctrl-C`.
@@ -225,7 +242,8 @@ rispettano il pattern, come QMD. `update` sincronizza le collection registrate;
 `query` è obbligatorio; `collections` filtra le collezioni; `mode` può essere
 `vector`, `fts` o `hybrid`; `top_k` limita i risultati. `rerank` accetta
 `true`, `false` o `null`: se assente o `null`, il server usa il reranking
-adattivo, che è il default.
+adattivo, che è il default. `POST /ask` usa lo stesso schema e aggiunge la
+risposta generata dal modello chat con le fonti citate.
 
 Gli altri endpoint sono:
 

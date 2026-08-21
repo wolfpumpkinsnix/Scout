@@ -25,6 +25,7 @@ import lancedb
 from lancedb.index import FTS
 from llama_cpp import LLAMA_POOLING_TYPE_RANK
 from src.indexer_support import (
+    DEFAULT_CHAT_MODEL,
     DEFAULT_EMBEDDING_MODEL,
     DEFAULT_RERANKER_MODEL,
     DOCUMENT_SUFFIXES,
@@ -68,6 +69,9 @@ class DocumentIndexerConfig:
     rerank_candidates: int = 12
     rerank_max_tokens: int = 1024
     reranker_context: int = 2048
+    chat_model_path: Path = Path(DEFAULT_CHAT_MODEL)
+    chat_context: int = 8192
+    answer_max_tokens: int = 512
     flash_attn: bool = False
     min_score: float = 0.0
 
@@ -84,6 +88,10 @@ class DocumentIndexerConfig:
             raise ValueError("rerank_max_tokens must be positive")
         if self.reranker_context < 1:
             raise ValueError("reranker_context must be positive")
+        if self.chat_context < 1:
+            raise ValueError("chat_context must be positive")
+        if not 0 < self.answer_max_tokens < self.chat_context:
+            raise ValueError("answer_max_tokens must be positive and smaller than chat_context")
         if not 0 <= self.min_score <= 1:
             raise ValueError("min_score must be between 0 and 1")
 
@@ -109,6 +117,11 @@ RERANK_INSTRUCTION = "Given a web search query, retrieve relevant passages that 
 RERANK_SYSTEM = (
     "Judge whether the Document meets the requirements based on the Query and the "
     'Instruct provided. Note that the answer can only be "yes" or "no".'
+)
+ANSWER_SYSTEM = (
+    "You are Scout, a local documentation assistant. Answer the question using "
+    "only the sources below. Cite sources inline as [1], [2], matching their "
+    "numbers. If the sources do not answer the question, say so plainly."
 )
 CHUNKER_VERSION = "adaptive-overlap-v4"
 LARGE_SECTION_CHARS = 1_000_000
@@ -202,6 +215,15 @@ OPENAPI_SPEC = {
                     "application/json": {"schema": {"$ref": "#/components/schemas/QueryInput"}}
                 }},
                 "responses": {"200": {"description": "Ranked search results"}},
+            },
+        },
+        "/ask": {
+            "post": {
+                "summary": "Answer a question from indexed documents",
+                "requestBody": {"required": True, "content": {
+                    "application/json": {"schema": {"$ref": "#/components/schemas/QueryInput"}}
+                }},
+                "responses": {"200": {"description": "Generated answer with sources"}},
             },
         },
         "/feedback": {
@@ -304,7 +326,8 @@ CONFIG_PATH = Path("config.json")
 CONFIG_KEYS: dict[str, Any] = {
     "model_path": str, "reranker_model_path": str, "gpu_layers": (str, int),
     "flash_attn": bool, "min_score": (int, float), "rerank_candidates": int,
-    "rerank_max_tokens": int, "reranker_context": int,
+    "rerank_max_tokens": int, "reranker_context": int, "chat_model_path": str,
+    "chat_context": int, "answer_max_tokens": int,
 }
 
 
@@ -419,6 +442,18 @@ def _reranker_prompt(query: str, document: str) -> str:
     )
 
 
+def _answer_prompt(query: str, sources: list[tuple[str, str]]) -> str:
+    context = "\n\n".join(
+        f"[{index}] {label}\n{text}"
+        for index, (label, text) in enumerate(sources, start=1)
+    )
+    return (
+        f"<|im_start|>system\n{ANSWER_SYSTEM}<|im_end|>\n"
+        f"<|im_start|>user\n{context}\n\nQuestion: {query}<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    )
+
+
 def _rerank(model: Any, query: str, candidates: list[Row],
             max_document_tokens: int = 1024) -> list[float]:
     started = time.perf_counter()
@@ -502,6 +537,18 @@ def load_embedding_model(path: Path, gpu_layers: str | int = "auto",
                          flash_attn: bool = False) -> Any:
     return load_model(str(path), embedding=True, gpu_layers=gpu_layers,
                       flash_attn=flash_attn)
+
+
+def load_chat_model(path: Path, gpu_layers: str | int = "auto",
+                    flash_attn: bool = False, context: int = 8192) -> Any:
+    try:
+        return load_model(str(path), embedding=False, gpu_layers=gpu_layers,
+                          context=context, flash_attn=flash_attn)
+    except Exception as error:
+        raise RuntimeError(
+            f"Unable to load chat model {path}: {error}. Run "
+            ".\\scripts\\download_models.ps1 -Model chat"
+        ) from error
 
 
 def _pdf_sections(text: str) -> list[tuple[int, int, str]]:
@@ -728,6 +775,7 @@ class DocumentIndexer:
         # field validation lives in DocumentIndexerConfig.__post_init__
         self.config = config
         self._reranker: Any | None = None
+        self._chat: Any | None = None
 
     @property
     def reranker_loaded(self) -> bool:
@@ -735,6 +783,13 @@ class DocumentIndexer:
 
     def reset_reranker(self) -> None:
         self._reranker = None
+
+    @property
+    def chat_loaded(self) -> bool:
+        return self._chat is not None
+
+    def reset_chat(self) -> None:
+        self._chat = None
 
     def index(
         self, path: Path, model: Any | None = None, collection: str = "default",
@@ -1312,6 +1367,75 @@ class DocumentIndexer:
                 ) from error
         return enrich(candidates[:top_k])
 
+    def generate_answer(self, query: str, results: list[Row],
+                        chat_model: Any | None = None) -> Row:
+        if not query.strip():
+            raise ValueError("query must not be empty")
+        if not results:
+            return {"answer": "No indexed passage matched the query.", "sources": []}
+        started = time.perf_counter()
+        if chat_model is None:
+            chat_model = self._chat
+        if chat_model is None:
+            load_started = time.perf_counter()
+            chat_model = load_chat_model(
+                self.config.chat_model_path, self.config.gpu_layers,
+                self.config.flash_attn, self.config.chat_context)
+            self._chat = chat_model
+            LOGGER.info("phase=load-chat-complete seconds=%.3f",
+                        time.perf_counter() - load_started)
+        budget = int(chat_model.n_ctx()) - self.config.answer_max_tokens - 32
+        if budget < 1:
+            raise ValueError("answer_max_tokens must leave room for the prompt")
+        sources: list[tuple[str, str]] = []
+        used: list[Row] = []
+        for result in results:
+            label = str(result.get("title") or result.get("relative_path") or "Untitled")
+            text = str(result.get("text") or "").strip()
+            if not text:
+                continue
+            text_tokens = list(chat_model.tokenize(
+                text.encode("utf-8"), add_bos=False, special=False))
+            while True:
+                prompt = _answer_prompt(query, sources + [(label, text)])
+                prompt_tokens = len(chat_model.tokenize(
+                    prompt.encode("utf-8"), add_bos=False, special=True))
+                if prompt_tokens <= budget:
+                    sources.append((label, text))
+                    used.append(result)
+                    break
+                if not text_tokens:
+                    break  # even an empty source overflows; skip it
+                keep = max(0, len(text_tokens) - (prompt_tokens - budget) - 8)
+                text_tokens = text_tokens[:keep]
+                text = chat_model.detokenize(text_tokens).decode("utf-8", errors="ignore")
+        if not sources:
+            raise RuntimeError(
+                "query and answer prompt exceed the chat model context window")
+        prompt = _answer_prompt(query, sources)
+        prompt_length = len(chat_model.tokenize(
+            prompt.encode("utf-8"), add_bos=False, special=True))
+        generate_started = time.perf_counter()
+        response: Any = chat_model.create_completion(
+            prompt, max_tokens=self.config.answer_max_tokens, temperature=0.7,
+            top_p=0.8, top_k=20, stop=["<|im_end|>", "<|im_start|>"])
+        answer = str(response["choices"][0]["text"]).strip()
+        usage = response.get("usage") or {}
+        LOGGER.info("phase=answer-complete sources=%d dropped=%d prompt_tokens=%d "
+                    "answer_tokens=%s seconds=%.3f total_seconds=%.3f",
+                    len(sources), len(results) - len(used), prompt_length,
+                    usage.get("completion_tokens", "?"),
+                    time.perf_counter() - generate_started,
+                    time.perf_counter() - started)
+        return {"answer": answer, "sources": used}
+
+    def answer(self, query: str, collections: list[str] | None = None,
+               mode: str = "hybrid", top_k: int = 5, model: Any | None = None,
+               rerank: bool | None = None, chat_model: Any | None = None) -> Row:
+        results = self.search(query, collections=collections, mode=mode, top_k=top_k,
+                              model=model, rerank=rerank)
+        return {"query": query, **self.generate_answer(query, results, chat_model)}
+
 
 def _write_json(value: Any) -> None:
     payload = json.dumps(value, ensure_ascii=False, indent=2) + "\n"
@@ -1333,7 +1457,8 @@ def _preload_embedding_model(indexer: DocumentIndexer, mode: str) -> Any | None:
 def _run_shell(indexer: DocumentIndexer, args: Any) -> None:
     rerank = True if getattr(args, "always_rerank", False) else False if args.no_rerank else None
     embedding_model = _preload_embedding_model(indexer, args.mode)
-    LOGGER.info("phase=shell-ready mode=%s; type exit or quit to stop", args.mode)
+    LOGGER.info("phase=shell-ready mode=%s; prefix with /ask to answer, exit or quit to stop",
+                args.mode)
     while True:
         try:
             query = input("query> ").strip()
@@ -1345,9 +1470,14 @@ def _run_shell(indexer: DocumentIndexer, args: Any) -> None:
         if not query:
             continue
         try:
-            _write_json(indexer.search(
-                query, collections=args.collection, mode=args.mode, top_k=args.top_k,
-                model=embedding_model, rerank=rerank))
+            if query.casefold().startswith("/ask "):
+                _write_json(indexer.answer(
+                    query[5:].strip(), collections=args.collection, mode=args.mode,
+                    top_k=args.top_k, model=embedding_model, rerank=rerank))
+            else:
+                _write_json(indexer.search(
+                    query, collections=args.collection, mode=args.mode, top_k=args.top_k,
+                    model=embedding_model, rerank=rerank))
         except (RuntimeError, ValueError) as error:
             clear_progress()
             LOGGER.error("%s", error)
@@ -1460,6 +1590,7 @@ def _run_server(indexer: DocumentIndexer, args: Any) -> None:
                     **indexer.status(),
                     "embedding_model_loaded": embedding_model is not None,
                     "reranker_model_loaded": indexer.reranker_loaded,
+                    "chat_model_loaded": indexer.chat_loaded,
                 })
                 return
             if parsed.path != "/health":
@@ -1469,6 +1600,7 @@ def _run_server(indexer: DocumentIndexer, args: Any) -> None:
                 "status": "ok",
                 "embedding_model_loaded": embedding_model is not None,
                 "reranker_model_loaded": indexer.reranker_loaded,
+                "chat_model_loaded": indexer.chat_loaded,
             })
 
         def do_DELETE(self) -> None:
@@ -1593,7 +1725,7 @@ def _run_server(indexer: DocumentIndexer, args: Any) -> None:
                                 target, model=embedding_model, collection=collection))
                     self._send(200, {"files": len(results), "results": results})
                     return
-                if path != "/query":
+                if path not in {"/query", "/ask"}:
                     self._send(404, {"error": "not found"})
                     return
                 payload = self._json_body()
@@ -1608,14 +1740,24 @@ def _run_server(indexer: DocumentIndexer, args: Any) -> None:
                 request_rerank = payload.get("rerank", rerank)
                 if not isinstance(request_rerank, bool) and request_rerank is not None:
                     raise ValueError("'rerank' must be a boolean or null")
-                result = indexer.search(
-                    query,
-                    collections=collections,
-                    mode=payload.get("mode", args.mode),
-                    top_k=payload.get("top_k", args.top_k),
-                    model=embedding_model,
-                    rerank=request_rerank,
-                )
+                if path == "/ask":
+                    result = indexer.answer(
+                        query,
+                        collections=collections,
+                        mode=payload.get("mode", args.mode),
+                        top_k=payload.get("top_k", args.top_k),
+                        model=embedding_model,
+                        rerank=request_rerank,
+                    )
+                else:
+                    result = indexer.search(
+                        query,
+                        collections=collections,
+                        mode=payload.get("mode", args.mode),
+                        top_k=payload.get("top_k", args.top_k),
+                        model=embedding_model,
+                        rerank=request_rerank,
+                    )
                 self._send(200, result)
             except (json.JSONDecodeError, OSError, TypeError, ValueError, RuntimeError) as error:
                 clear_progress()
@@ -1641,6 +1783,8 @@ def _run_server(indexer: DocumentIndexer, args: Any) -> None:
                                     time.perf_counter() - load_started)
                     if new_config.reranker_model_path != old.reranker_model_path:
                         indexer.reset_reranker()  # lazy reload on next query
+                    if new_config.chat_model_path != old.chat_model_path:
+                        indexer.reset_chat()  # lazy reload on next answer
                     indexer.config = new_config
                     _write_config(CONFIG_PATH, _config_snapshot(new_config))
                     self._send(200, _config_snapshot(new_config))
@@ -1761,6 +1905,9 @@ def _add_search_arguments(command: Any) -> None:
     command.add_argument("--rerank-candidates", type=int, default=12)
     command.add_argument("--rerank-max-tokens", type=int, default=1024)
     command.add_argument("--reranker-context", type=int, default=2048)
+    command.add_argument("--chat-model", type=Path, default=Path(DEFAULT_CHAT_MODEL))
+    command.add_argument("--chat-context", type=int, default=8192)
+    command.add_argument("--answer-max-tokens", type=int, default=512)
     rerank = command.add_mutually_exclusive_group()
     rerank.add_argument("--no-rerank", action="store_true")
     rerank.add_argument("--always-rerank", action="store_true")
@@ -1787,6 +1934,9 @@ def main() -> int:
     query = subparsers.add_parser("query")
     query.add_argument("text")
     _add_search_arguments(query)
+    ask = subparsers.add_parser("ask")
+    ask.add_argument("text")
+    _add_search_arguments(ask)
     shell = subparsers.add_parser("shell")
     _add_search_arguments(shell)
     server = subparsers.add_parser("serve")
@@ -1845,6 +1995,9 @@ def main() -> int:
             rerank_candidates=getattr(args, "rerank_candidates", 12),
             rerank_max_tokens=getattr(args, "rerank_max_tokens", 1024),
             reranker_context=getattr(args, "reranker_context", 2048),
+            chat_model_path=getattr(args, "chat_model", Path(DEFAULT_CHAT_MODEL)),
+            chat_context=getattr(args, "chat_context", 8192),
+            answer_max_tokens=getattr(args, "answer_max_tokens", 512),
             flash_attn=getattr(args, "flash_attn", False),
             index_path=getattr(args, "index_path", Path("index.yml")),
             min_score=getattr(args, "min_score", 0.0),
@@ -1854,7 +2007,9 @@ def main() -> int:
                       "gpu_layers": "gpu_layers", "flash_attn": "flash_attn",
                       "min_score": "min_score", "rerank_candidates": "rerank_candidates",
                       "rerank_max_tokens": "rerank_max_tokens",
-                      "reranker_context": "reranker_context"}
+                      "reranker_context": "reranker_context",
+                      "chat_model": "chat_model_path", "chat_context": "chat_context",
+                      "answer_max_tokens": "answer_max_tokens"}
         defaults = DocumentIndexerConfig()
         file_values = _read_config(CONFIG_PATH)
         merged = {
@@ -1904,6 +2059,11 @@ def main() -> int:
             result = _run_chunk(args.file, args.chunk_size, args.chunk_overlap)
         elif args.command == "benchmark":
             result = _run_benchmark(indexer, args)
+        elif args.command == "ask":
+            result = indexer.answer(
+                args.text, collections=args.collection, mode=args.mode, top_k=args.top_k,
+                model=_preload_embedding_model(indexer, args.mode),
+                rerank=True if args.always_rerank else False if args.no_rerank else None)
         else:
             result = indexer.search(
                 args.text, collections=args.collection, mode=args.mode, top_k=args.top_k,

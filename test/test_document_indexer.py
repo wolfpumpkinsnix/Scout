@@ -72,6 +72,28 @@ class FakeReranker:
         return result
 
 
+class FakeChatModel:
+    def __init__(self, context=4096, text="Declare it with a type and a name [1]."):
+        self.context = context
+        self.text = text
+        self.prompts = []
+        self.options = []
+
+    def n_ctx(self):
+        return self.context
+
+    def tokenize(self, value, **_):
+        return list(value)
+
+    def detokenize(self, tokens):
+        return bytes(tokens)
+
+    def create_completion(self, prompt, **kwargs):
+        self.prompts.append(prompt)
+        self.options.append(kwargs)
+        return {"choices": [{"text": self.text}], "usage": {"completion_tokens": 7}}
+
+
 def one_chunk_per_document(documents, _chunk_size, _chunk_overlap):
     return [DocumentChunk(document, 0, document.text, 0) for document in documents]
 
@@ -682,6 +704,76 @@ class DocumentIndexerTests(unittest.TestCase):
                       side_effect=AssertionError("must not load")):
             DocumentIndexer().search("query", mode="fts")
             DocumentIndexer().search("query", mode="vector", model=FakeEmbeddingModel())
+
+    def test_answer_cites_sources_and_reuses_chat_model(self):
+        results = [
+            {"title": "Variables", "relative_path": "csharp/variables.md",
+             "text": "Declare a variable with a type and a name: int count;"},
+            {"title": "Constants", "relative_path": "csharp/constants.md",
+             "text": "Use const for compile-time constants."},
+        ]
+        chat = FakeChatModel()
+        indexer = DocumentIndexer()
+        with patch("src.document_indexer.load_chat_model", return_value=chat) as load:
+            first = indexer.generate_answer("How do I declare a variable?", results)
+            indexer.generate_answer("How do I declare a constant?", results)
+        load.assert_called_once()
+        self.assertEqual(first["answer"], chat.text)
+        self.assertEqual(first["sources"], results)
+        self.assertIn("[1] Variables", chat.prompts[0])
+        self.assertIn("[2] Constants", chat.prompts[0])
+        self.assertIn("Question: How do I declare a variable?", chat.prompts[0])
+        self.assertEqual(chat.options[0]["max_tokens"], 512)
+        self.assertIn("<|im_end|>", chat.options[0]["stop"])
+
+    def test_answer_handles_empty_results_and_missing_model(self):
+        empty = DocumentIndexer().generate_answer("q", [], FakeChatModel())
+        self.assertEqual(empty["sources"], [])
+        self.assertIn("No indexed passage", empty["answer"])
+        missing = DocumentIndexer(DocumentIndexerConfig(
+            chat_model_path=Path("missing.gguf")))
+        with self.assertRaisesRegex(RuntimeError, "download_models.ps1 -Model chat"):
+            missing.generate_answer("q", [{"title": "t", "text": "body"}])
+
+    def test_answer_truncates_sources_to_fit_budget(self):
+        chat = FakeChatModel(context=1024)
+        indexer = DocumentIndexer(DocumentIndexerConfig(
+            chat_context=1024, answer_max_tokens=128))
+        results = [{"title": "Long", "relative_path": "long.md", "text": "word " * 500}]
+        generated = indexer.generate_answer("q", results, chat)
+        budget = 1024 - 128 - 32
+        self.assertLessEqual(len(chat.prompts[0].encode("utf-8")), budget)
+        self.assertNotIn("word " * 500, chat.prompts[0])
+        self.assertEqual(generated["sources"], results)
+
+    def test_answer_runs_search_then_generation(self):
+        values = [{"id": "a", "document_id": "d", "collection": "c",
+                   "text": "declare with type and name", "chunk_index": 0,
+                   "total_chunks": 1, "position": 0, "_distance": 0.1}]
+        table = FakeTable([], values)
+        chat = FakeChatModel()
+        indexer = DocumentIndexer()
+        with patch("src.document_indexer.lancedb.connect", return_value=FakeDb(table)):
+            result = indexer.answer("How do I declare a variable in C#?",
+                                    mode="vector", model=FakeEmbeddingModel(),
+                                    chat_model=chat)
+        self.assertEqual(result["query"], "How do I declare a variable in C#?")
+        self.assertEqual(result["answer"], chat.text)
+        self.assertEqual(result["sources"][0]["id"], "a")
+        self.assertIn("declare with type and name", chat.prompts[0])
+
+    def test_shell_ask_prefix_generates_answer(self):
+        indexer = SimpleNamespace()
+        indexer.answer = Mock(return_value={"query": "q", "answer": "a", "sources": []})
+        args = SimpleNamespace(
+            no_rerank=False, always_rerank=False, mode="hybrid", collection=None, top_k=5)
+        with patch("src.document_indexer._preload_embedding_model", return_value=None), \
+                patch("builtins.input", side_effect=["/ask declare a variable", "exit"]), \
+                patch("src.document_indexer._write_json") as write:
+            _run_shell(indexer, args)
+        indexer.answer.assert_called_once()
+        self.assertEqual(indexer.answer.call_args.args[0], "declare a variable")
+        write.assert_called_once_with({"query": "q", "answer": "a", "sources": []})
 
 
 if __name__ == "__main__":
