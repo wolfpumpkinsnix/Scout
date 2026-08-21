@@ -74,6 +74,26 @@ uv run python -m src.document_indexer query "Ecolabel" --mode hybrid
 `vector` uses semantic similarity, `fts` uses LanceDB full-text search, and
 `hybrid` combines both ranked lists with Reciprocal Rank Fusion.
 
+## HTTP server
+
+Keep the embedding model warm across client processes with the local server:
+
+```powershell
+uv run python -m src.document_indexer serve `
+  --collection italia --db-path data\lancedb
+```
+
+Endpoints:
+
+- `GET /health`: returns `{"status":"ok"}`.
+- `GET /collections`: returns active collection names.
+- `POST /query`: accepts `query` (required), optional `collections` (string
+  array), `mode` (`vector`, `fts`, or `hybrid`), `top_k`, and `rerank`.
+
+`rerank` can be `true`, `false`, or `null`. Missing or `null` uses adaptive
+reranking, the default. The server binds to `127.0.0.1:8181`; use `--host`
+and `--port` to change it.
+
 ## Code map
 
 - `src/document_indexer.py`: only application entry point and search/index logic.

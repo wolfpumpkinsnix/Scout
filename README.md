@@ -118,6 +118,23 @@ Poi invia le query a `http://127.0.0.1:8181/query` con JSON
 `{"query":"Ecolabel","rerank":false}`. `GET /collections` restituisce le collezioni attive,
 mentre `GET /health` verifica che il server sia attivo; termina con `Ctrl-C`.
 
+`POST /query` accetta:
+
+```json
+{
+  "query": "come funziona Ecolabel?",
+  "collections": ["italia", "azienda"],
+  "mode": "hybrid",
+  "top_k": 5,
+  "rerank": null
+}
+```
+
+`query` è obbligatorio; `collections` filtra le collezioni; `mode` può essere
+`vector`, `fts` o `hybrid`; `top_k` limita i risultati. `rerank` accetta
+`true`, `false` o `null`: se assente o `null`, il server usa il reranking
+adattivo, che è il default.
+
 Il benchmark incluso misura recall, reciprocal rank e latenza sulle query note:
 
 ```powershell
